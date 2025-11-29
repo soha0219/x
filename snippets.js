@@ -15,7 +15,7 @@ export default {
       
       if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
         return new URL(request.url).pathname === '/' 
-          ? new Response('Hellow World', { status: 200 })
+          ? new Response('Hello World', { status: 200 })
           : new Response('Expected WebSocket', { status: 426 });
       }
 
