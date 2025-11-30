@@ -255,64 +255,74 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 }
 
 func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
-	host, port, path, err := parseServerAddr(serverAddr)
-	if err != nil {
-		return nil, err
-	}
+    host, port, path, err := parseServerAddr(serverAddr)
+    if err != nil {
+        return nil, err
+    }
 
-	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+    wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		echBytes, echErr := getECHList()
-		if echErr != nil {
-			if attempt < maxRetries {
-				refreshECH()
-				continue
-			}
-			return nil, echErr
-		}
+    for attempt := 1; attempt <= maxRetries; attempt++ {
+        echBytes, echErr := getECHList()
+        if echErr != nil {
+            if attempt < maxRetries {
+                refreshECH()
+                continue
+            }
+            return nil, echErr
+        }
 
-		tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
-		if tlsErr != nil {
-			return nil, tlsErr
-		}
+        tlsCfg, tlsErr := buildTLSConfigWithECH(host, echBytes)
+        if tlsErr != nil {
+            return nil, tlsErr
+        }
 
-		dialer := websocket.Dialer{
-			TLSClientConfig: tlsCfg,
-			Subprotocols: func() []string {
-				if token == "" {
-					return nil
-				}
-				return []string{token}
-			}(),
-			HandshakeTimeout: 10 * time.Second,
-		}
+        dialer := websocket.Dialer{
+            TLSClientConfig: tlsCfg,
+            Subprotocols: func() []string {
+                if token == "" {
+                    return nil
+                }
+                return []string{token}
+            }(),
+            HandshakeTimeout: 10 * time.Second,
+        }
 
-		if serverIP != "" {
-			dialer.NetDial = func(network, address string) (net.Conn, error) {
-				_, port, err := net.SplitHostPort(address)
-				if err != nil {
-					return nil, err
-				}
-				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
-			}
-		}
+        if serverIP != "" {
+            dialer.NetDial = func(network, address string) (net.Conn, error) {
+                _, port, err := net.SplitHostPort(address)
+                if err != nil {
+                    return nil, err
+                }
 
-		wsConn, _, dialErr := dialer.Dial(wsURL, nil)
-		if dialErr != nil {
-			if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
-				log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
-				refreshECH()
-				time.Sleep(time.Second)
-				continue
-			}
-			return nil, dialErr
-		}
+                // 添加的改进代码（完整 IPv6 支持）
+                ipHost := serverIP
+                userHost, userPort, splitErr := net.SplitHostPort(serverIP)
+                if splitErr == nil {
+                    // 如果 serverIP 带端口，剥离并使用它（覆盖原 port）
+                    ipHost = userHost
+                    port = userPort  // 覆盖原 port（如果不想覆盖，注释此行）
+                } // else: 无端口或无效格式，使用原 serverIP + 原 port
 
-		return wsConn, nil
-	}
+                return net.DialTimeout(network, net.JoinHostPort(ipHost, port), 10*time.Second)
+            }
+        }
 
-	return nil, errors.New("连接失败，已达最大重试次数")
+        wsConn, _, dialErr := dialer.Dial(wsURL, nil)
+        if dialErr != nil {
+            if strings.Contains(dialErr.Error(), "ECH") && attempt < maxRetries {
+                log.Printf("[ECH] 连接失败，尝试刷新配置 (%d/%d)", attempt, maxRetries)
+                refreshECH()
+                time.Sleep(time.Second)
+                continue
+            }
+            return nil, dialErr
+        }
+
+        return wsConn, nil
+    }
+
+    return nil, errors.New("连接失败，已达最大重试次数")
 }
 
 // ======================== 统一代理服务器 ========================
