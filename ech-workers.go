@@ -618,9 +618,11 @@ func runProxyServer(addr string) {
 	}
 }
 
+// [修改 1] handleConn 现在获取 clientAddr
 func handleConn(conn net.Conn) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(60 * time.Second))
+	clientAddr := conn.RemoteAddr().String() // 获取客户端地址
 
 	buf := make([]byte, 1)
 	if _, err := io.ReadFull(conn, buf); err != nil {
@@ -628,18 +630,16 @@ func handleConn(conn net.Conn) {
 	}
 
 	if buf[0] == 0x05 {
-		handleSOCKS5(conn)
+		handleSOCKS5(conn, clientAddr) // 传递 clientAddr
 	} else {
-		handleHTTP(conn, buf[0])
+		handleHTTP(conn, clientAddr, buf[0]) // 传递 clientAddr
 	}
 }
 
-// ---------------- SOCKS5 ----------------
-
-func handleSOCKS5(conn net.Conn) {
+// [修改 2] handleSOCKS5 接收 clientAddr 并添加日志
+func handleSOCKS5(conn net.Conn, clientAddr string) {
 	// Handshake
 	buf := make([]byte, 256)
-	// 【关键修复】使用 _ 忽略 n，避免未使用变量报错
 	_, err := io.ReadAtLeast(conn, buf, 1) 
 	if err != nil {
 		return
@@ -689,13 +689,14 @@ func handleSOCKS5(conn net.Conn) {
 	target := fmt.Sprintf("%s:%d", host, port)
 
 	if cmd == 0x01 { // CONNECT
-		log.Printf("[SOCKS5] TCP 连接: %s", target)
+		// [新增日志] 恢复旧版日志格式
+		log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		startTunnel(conn, target, false, nil)
-	} else if cmd == 0x03 { // UDP ASSOCIATE (V1 特性)
+	} else if cmd == 0x03 { // UDP ASSOCIATE
 		handleUDPAssociate(conn)
 	} else {
-		conn.Write([]byte{0x05, 0x07, 0, 0, 0, 0, 0, 0}) // Cmd not supported
+		conn.Write([]byte{0x05, 0x07, 0, 0, 0, 0, 0, 0})
 	}
 }
 
@@ -741,11 +742,9 @@ func processUDP(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
 	if len(data) < 3 {
 		return
 	}
-	// FRAG(1) + ATYP(1) ...
 	if data[2] != 0x00 { // No fragment support
 		return
 	}
-	// Parse header to find dest port
 	pos := 3
 	atyp := data[pos]
 	pos++
@@ -765,12 +764,9 @@ func processUDP(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
 	payload := data[pos:]
 
 	if port == 53 {
-		// DoH Query Logic (通过 ECH 隧道查 DNS)
-		// 构建 DoH 请求到 Cloudflare
 		go func() {
 			resp, err := queryDoHForProxy(payload)
 			if err == nil {
-				// Construct UDP header back
 				resHeader := make([]byte, pos)
 				copy(resHeader, data[:pos])
 				final := append(resHeader, resp...)
@@ -780,7 +776,6 @@ func processUDP(conn *net.UDPConn, clientAddr *net.UDPAddr, data []byte) {
 	}
 }
 
-// queryDoHForProxy 使用 ECH 配置通过 HTTPS 查询 Cloudflare DNS
 func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 	echBytes, err := getECHList()
 	if err != nil {
@@ -805,10 +800,8 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// ---------------- HTTP ----------------
-
-func handleHTTP(conn net.Conn, firstByte byte) {
-	// Reconstruct buffer
+// [修改 3] handleHTTP 接收 clientAddr 并添加日志
+func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader([]byte{firstByte}), conn))
 	reqLine, err := reader.ReadString('\n')
 	if err != nil {
@@ -824,11 +817,11 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 	var target string
 	if method == "CONNECT" {
 		target = urlStr
-		log.Printf("[HTTP] CONNECT: %s", target)
+		// [新增日志]
+		log.Printf("[HTTP] %s -> CONNECT %s", clientAddr, target)
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		startTunnel(conn, target, false, nil)
 	} else {
-		// Proxy Request
 		if strings.HasPrefix(urlStr, "http://") {
 			u, _ := url.Parse(urlStr)
 			target = u.Host
@@ -841,7 +834,6 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 			}
 			newReqLine := fmt.Sprintf("%s %s %s\r\n", method, path, parts[2])
 			
-			// Read remaining headers
 			var headers bytes.Buffer
 			headers.WriteString(newReqLine)
 			for {
@@ -854,10 +846,10 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 					headers.WriteString(line)
 				}
 			}
-			// Read Body if exists (simplification)
-			rest, _ := io.ReadAll(reader) // Note: this blocks if Keep-Alive, simplified for example
+			rest, _ := io.ReadAll(reader)
 			allData := append(headers.Bytes(), rest...)
-			log.Printf("[HTTP] Proxy: %s", target)
+			// [新增日志]
+			log.Printf("[HTTP] %s -> %s %s", clientAddr, method, target)
 			startTunnel(conn, target, true, allData)
 		}
 	}
@@ -867,9 +859,12 @@ func handleHTTP(conn net.Conn, firstByte byte) {
 
 func startTunnel(clientConn net.Conn, target string, isDirectHTTP bool, firstFrame []byte) {
 	// 1. 分流判断
-	host, _, _ := net.SplitHostPort(target)
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		host = target // 处理没有端口的情况
+	}
 	if shouldBypassProxy(host) {
-		log.Printf("[分流] 直连: %s", target)
+		log.Printf("[分流] %s -> %s (直连)", clientConn.RemoteAddr().String(), target)
 		startDirect(clientConn, target, firstFrame)
 		return
 	}
@@ -878,7 +873,7 @@ func startTunnel(clientConn net.Conn, target string, isDirectHTTP bool, firstFra
 	clientConn.SetDeadline(time.Time{})
 	wsConn, err := dialWebSocketWithECH(2)
 	if err != nil {
-		log.Printf("[隧道] 连接 WebSocket 失败: %v", err)
+		log.Printf("[隧道] %s -> %s 连接 WebSocket 失败: %v", clientConn.RemoteAddr().String(), target, err)
 		return
 	}
 	defer wsConn.Close()
@@ -894,7 +889,7 @@ func startTunnel(clientConn net.Conn, target string, isDirectHTTP bool, firstFra
 	// 等待响应
 	_, msg, err := wsConn.ReadMessage()
 	if err != nil || string(msg) != "CONNECTED" {
-		log.Printf("[隧道] 握手失败: %s", string(msg))
+		log.Printf("[隧道] %s -> %s 握手失败: %s", clientConn.RemoteAddr().String(), target, string(msg))
 		return
 	}
 
