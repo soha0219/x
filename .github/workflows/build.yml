@@ -19,19 +19,20 @@ jobs:
         with:
           go-version: '1.23' # ECH 功能需要 Go 1.23+
 
-      # 步骤3: 初始化并锁定依赖版本 (!!! 关键修复 !!!)
-      - name: Initialize and Lock Dependencies
+      # 步骤3: 初始化并强制锁定依赖版本 (!!! 最终修复 !!!)
+      - name: Initialize and Force Dependency Version
         run: |
+          # 初始化模块，创建 go.mod 文件
           go mod init github.com/your-repo/ech-workers
-          
-          # --- 核心修复 ---
-          # 强制 "钉死" xray-core 到一个我们代码兼容的稳定版本 (v1.8.11)
-          # 这样 go mod tidy 就不会去下载导致错误的最新版
-          echo "Pinning xray-core to a compatible version..."
-          go get github.com/xtls/xray-core@v1.8.11
-          
-          # 自动整理和下载所有依赖
-          echo "Tidying modules..."
+
+          # --- 核心修复：使用 replace 指令下达强制命令 ---
+          # 直接向 go.mod 文件追加一行 replace 指令
+          # 这会强制 Go 的所有模块解析都使用 v1.8.11 版本
+          echo "Forcing xray-core version to v1.8.11 using 'replace' directive..."
+          echo "replace github.com/xtls/xray-core => github.com/xtls/xray-core v1.8.11" >> go.mod
+
+          # 现在运行 tidy，它将别无选择，只能遵守 replace 的规定
+          echo "Tidying modules with forced version..."
           go mod tidy
 
       # 步骤4: 编译 Windows 可执行文件
