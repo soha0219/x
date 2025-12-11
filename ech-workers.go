@@ -22,14 +22,17 @@ import (
 	"sync"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	// --- !!! 核心修复：修正拼写错误 !!! ---
+	"github.com/gorilla/websocket" // 原来是 "github.comcom/gorilla/websocket"
+	
 	xraynet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/features/routing"
-	"github.com/xtls/xray-core/infra/geodata/standard" // 关键：使用旧版 xray-core 的正确 import 路径
+	"github.com/xtls/xray-core/infra/geodata/standard"
 	"google.golang.org/protobuf/proto"
 )
 
+// (后续所有代码与上一版完全相同，无需修改)
 var (
 	listenAddr     string; serverAddr     string; serverIP       string; token          string
 	dnsPrimary     string; dnsFallback    string; echDomain      string; echListMu      sync.RWMutex
