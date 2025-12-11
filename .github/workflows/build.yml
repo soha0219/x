@@ -1,4 +1,3 @@
-# 工作流名称
 name: Build Single-File ECH Workers (Final)
 
 on:
@@ -9,36 +8,30 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 步骤1: 检出代码 (包含 go.mod)
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 步骤2: 设置 Go 语言环境
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
 
-      # 步骤3: 下载路由规则文件
       - name: Download routing assets for embedding
         run: |
           echo "Downloading latest geoip.dat and geosite.dat..."
           curl -L -o geoip.dat https://github.com/v2fly/geoip/releases/latest/download/geoip.dat
           curl -L -o geosite.dat https://github.com/v2fly/domain-list-community/releases/latest/download/geosite.dat
 
-      # ⭐ 修复 google/pprof 失效版本（必须加）
+      # Fix pprof invalid revision (preemptively)
       - name: Fix broken pprof version
         run: go get github.com/google/pprof@v0.0.0-20240308175358-30a5e420f0f2
 
-      # 步骤4: 下载 Go 模块
       - name: Download Go Modules
         run: go mod download
 
-      # 步骤5: 编译 Windows 可执行文件
       - name: Build Windows executable with embedded assets
         run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
 
-      # 步骤6: 上传最终的单文件产物
       - name: Upload single-file artifact
         uses: actions/upload-artifact@v4
         with:
