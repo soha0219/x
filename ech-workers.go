@@ -639,7 +639,8 @@ func handleConn(conn net.Conn) {
 func handleSOCKS5(conn net.Conn) {
 	// Handshake
 	buf := make([]byte, 256)
-	n, err := io.ReadAtLeast(conn, buf, 1) // NMETHODS
+	// 【关键修复】将 n 替换为 _，因为后续没有使用 n
+	_, err := io.ReadAtLeast(conn, buf, 1) // NMETHODS
 	if err != nil {
 		return
 	}
