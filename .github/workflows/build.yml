@@ -1,0 +1,48 @@
+# 工作流名称，可以自己取
+name: Manual Build ech-workers.exe
+
+# 触发条件：只允许手动触发
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # 使用最新的 ubuntu 虚拟环境来执行任务
+    runs-on: ubuntu-latest
+
+    steps:
+      # 步骤1: 检出代码
+      # 即使是手动触发，也需要先检出你想要编译的那个版本的代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 步骤2: 设置 Go 语言环境
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      # 步骤3: 初始化 Go 模块 (如果 go.mod 不存在)
+      - name: Initialize Go module
+        run: go mod init github.com/soha0219/ech-s2
+
+      # 步骤4: 自动整理和下载依赖
+      # Actions 的服务器网络很好，可以直接运行 go mod tidy
+      - name: Tidy and download dependencies
+        run: go mod tidy
+
+      # 步骤5: 编译 Windows 可执行文件
+      # GOOS=windows 告诉编译器目标是 Windows
+      # -o ech-workers.exe 指定输出文件名为 ech-workers.exe
+      # ./ech-workers.go 指定要编译的源文件
+      - name: Build Windows executable
+        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
+
+      # 步骤6: 上传编译好的 .exe 文件作为产物
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # 上传的压缩包名字
+          name: ech-workers-binary
+          # 要上传的文件路径
+          path: ech-workers.exe
