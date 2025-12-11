@@ -20,7 +20,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.23'
 
       # 步骤3: 初始化 Go 模块 (如果 go.mod 不存在)
       - name: Initialize Go module
