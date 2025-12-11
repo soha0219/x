@@ -1,42 +1,33 @@
-# 工作流名称
-name: Build ECH Workers (with Routing Rules)
+name: Manual Build ech-workers
 
 on:
   workflow_dispatch:
 
 jobs:
-  build-windows-package:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23' # 使用 1.23 即可
+          # 对于这个纯净版代码，1.23 就足够了
+          go-version: '1.23' 
 
-      - name: Initialize and Force Dependency Version
+      - name: Initialize and Tidy
         run: |
           go mod init github.com/your-repo/ech-workers
-          # 关键修复：使用 replace 强制锁定 xray-core 版本
-          echo "replace github.com/xtls/xray-core => github.com/xtls/xray-core v1.8.11" >> go.mod
           go mod tidy
 
-      - name: Build Windows executable
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
-
-      - name: Download routing assets
+      - name: Build Windows
         run: |
-          curl -L -o geoip.dat https://github.com/loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
-          curl -L -o geosite.dat https://github.com/loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
 
-      - name: Upload full package as artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ech-workers-full-package-windows
-          path: |
-            ech-workers.exe
-            geoip.dat
-            geosite.dat
+          # 上传产物只包含 exe
+          name: ech-workers-package
+          path: ech-workers.exe
