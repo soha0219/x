@@ -9,18 +9,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 步骤1: 检出代码
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 步骤2: 设置 Go 语言环境
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          # 使用 1.23 即可，xray-core v1.8.11 不需要更高版本
-          go-version: '1.23'
+          go-version: '1.23' # 使用 1.23 即可
 
-      # 步骤3: 初始化并强制锁定依赖版本 (最终修复)
       - name: Initialize and Force Dependency Version
         run: |
           go mod init github.com/your-repo/ech-workers
@@ -28,17 +24,14 @@ jobs:
           echo "replace github.com/xtls/xray-core => github.com/xtls/xray-core v1.8.11" >> go.mod
           go mod tidy
 
-      # 步骤4: 编译 Windows 可执行文件
       - name: Build Windows executable
         run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-workers.exe ./ech-workers.go
 
-      # 步骤5: 下载最新的路由规则文件
       - name: Download routing assets
         run: |
           curl -L -o geoip.dat https://github.com/loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
           curl -L -o geosite.dat https://github.com/loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
 
-      # 步骤6: 上传包含所有文件的完整软件包
       - name: Upload full package as artifact
         uses: actions/upload-artifact@v4
         with:
