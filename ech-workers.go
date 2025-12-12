@@ -1,4 +1,5 @@
-// ech-proxy-core.go - v4.0.1 Unified Engine (Build Fix)
+
+// ech-proxy-core.go - v4.0.1 Unified Engine (SOCKS5 Handshake Bug Fixed)
 package main
 
 import (
@@ -77,7 +78,6 @@ var (
 	chinaIPV6RangesMu sync.RWMutex
 )
 
-// 【【【已修复】】】 重新声明常量
 const typeHTTPS = 65
 
 type ipRange struct { start uint32; end uint32 }
@@ -204,22 +204,52 @@ func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode
 }
 
 
-// ======================== Full Protocol Handlers ========================
+// ======================== Protocol Handlers (SOCKS5 Bug Fixed) ========================
 
 const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
 
 func handleSOCKS5(conn net.Conn, clientAddr, inboundTag string) error {
-	if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil { return err } 
-	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil { return err }
-	header := make([]byte, 4); if _, err := io.ReadFull(conn, header); err != nil { return err }
-	cmd, atyp := header[1], header[3]; var host string
-	switch atyp {
-	case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
-	case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
-	case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
-	default: return errors.New("unsupported address type")
+	// 【【【BUG修复】】】
+	// 创建一个2字节的缓冲区，正确读取SOCKS5协商阶段剩下的两个字节(NMETHODS和METHODS[0])
+	handshakeBuf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, handshakeBuf); err != nil {
+		return err
 	}
-	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes)
+
+	// 协商成功，响应客户端
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return err
+	}
+	
+	// 读取客户端的连接请求
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return err
+	}
+	
+	cmd, atyp := header[1], header[3]
+	var host string
+	switch atyp {
+	case 1: // IPv4
+		b := make([]byte, 4)
+		io.ReadFull(conn, b)
+		host = net.IP(b).String()
+	case 3: // Domain
+		b := make([]byte, 1)
+		io.ReadFull(conn, b)
+		d := make([]byte, b[0])
+		io.ReadFull(conn, d)
+		host = string(d)
+	case 4: // IPv6
+		b := make([]byte, 16)
+		io.ReadFull(conn, b)
+		host = net.IP(b).String()
+	default:
+		return errors.New("unsupported address type")
+	}
+	portBytes := make([]byte, 2)
+	io.ReadFull(conn, portBytes)
+	port := binary.BigEndian.Uint16(portBytes)
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 	switch cmd {
@@ -246,7 +276,6 @@ func parseHTTP(conn net.Conn, clientAddr string, firstByte byte, inboundTag stri
 	log.Printf("[%s] HTTP: %s -> %s %s", inboundTag, clientAddr, req.Method, req.URL.Host)
 	var buf bytes.Buffer
 	if err := req.WriteProxy(&buf); err != nil { return "", nil, 0, err }
-	// We need to read the body if it exists
 	if req.ContentLength > 0 {
 		body, _ := io.ReadAll(req.Body)
 		buf.Write(body)
