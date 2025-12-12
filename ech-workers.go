@@ -1,5 +1,5 @@
-// ech-proxy-core.go - v5.3 (SOCKS5 Forwarding & Compile Fix)
-// 协议内核：修复了SOCKS5握手后数据流处理不当导致连接失败的根本问题
+// ech-proxy-core.go - v5.4 (Compile Fixed & Final)
+// 协议内核：修复了所有编译错误，并保持了 v5.3 的稳定转发逻辑。
 package main
 
 import (
@@ -19,15 +19,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket" // 【【【核心修复】】】
+	"github.com/gorilla/websocket"
 )
 
-// ... (The rest of the code is identical to the previous version and is correct) ...
+// ======================== Config Structures ========================
+
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -59,6 +59,9 @@ type Rule struct {
 	Port        []int    `json:"port,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
+
+// ======================== Global State ========================
+
 var (
 	globalConfig      Config
 	proxySettingsMap  = make(map[string]ProxySettings)
@@ -67,14 +70,16 @@ var (
 	chinaIPRangesMu   sync.RWMutex
 	chinaIPV6RangesMu sync.RWMutex
 )
+
 type ipRange struct { start uint32; end uint32 }
 type ipRangeV6 struct { start [16]byte; end [16]byte }
 
-// --- Main Logic (Unchanged) ---
+// ======================== Main Logic ========================
+
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v1.2 Starting...")
+	log.Println("[Core] X-Link Kernel v1.3 Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -99,6 +104,7 @@ func parseOutbounds() {
         }
     }
 }
+
 func runInbound(ib Inbound) {
     listener, err := net.Listen("tcp", ib.Listen)
     if err != nil { log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err); return }
@@ -110,37 +116,52 @@ func runInbound(ib Inbound) {
     }
 }
 
-// --- 【【CORE FIX】】---
-// The main connection handler is now simpler.
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
     defer conn.Close()
     
-    // Sniff the first byte to determine protocol
     buf := make([]byte, 1)
     if _, err := io.ReadFull(conn, buf); err != nil { return }
 
+    var target string
+    var err error
+    var firstFrame []byte
+    var mode int
+
     switch buf[0] {
     case 0x05: // SOCKS5
-        handleSOCKS5(conn, inboundTag)
+        target, err = handleSOCKS5(conn, inboundTag)
+        mode = 1 // modeSOCKS5
     case 'C', 'G', 'P', 'H', 'D', 'O', 'T': // HTTP
-        handleHTTP(conn, buf, inboundTag)
+        target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
+    default:
+        return
     }
+
+    if err != nil {
+        log.Printf("[%s] Protocol error: %v", inboundTag, err)
+        return
+    }
+    
+    outboundTag := route(target, inboundTag)
+    log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
+    
+    dispatch(conn, target, outboundTag, firstFrame, mode)
 }
 
-// --- Protocol Handlers (Rewritten for clarity) ---
 
-func handleSOCKS5(conn net.Conn, inboundTag string) {
-    // 1. SOCKS5 Handshake
+// --- Protocol Handlers ---
+
+func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
     handshakeBuf := make([]byte, 2)
-    if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return }
+    if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return "", err }
     conn.Write([]byte{0x05, 0x00}) // No auth
 
     header := make([]byte, 4)
-    if _, err := io.ReadFull(conn, header); err != nil { return }
+    if _, err := io.ReadFull(conn, header); err != nil { return "", err }
     
     if header[1] != 0x01 { // Only CONNECT command is supported
         conn.Write([]byte{0x05, 0x07, 0x00, 0x01})
-        return
+        return "", errors.New("unsupported SOCKS5 command")
     }
 
     var host string
@@ -148,91 +169,98 @@ func handleSOCKS5(conn net.Conn, inboundTag string) {
     case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
     case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
     case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
-    default: return
+    default: return "", errors.New("bad addr type")
     }
     portBytes := make([]byte, 2); io.ReadFull(conn, portBytes)
     port := binary.BigEndian.Uint16(portBytes)
     target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
     log.Printf("[%s] SOCKS5: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
+    return target, nil
+}
 
-    // 2. Route and dispatch
-    outboundTag := route(target, inboundTag)
-    log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
+func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
+    reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
+    req, err := http.ReadRequest(reader)
+    if err != nil { return "", nil, 0, err }
+
+    target := req.Host
+    mode := 2 // modeHTTPConnect
+
+    if req.Method == "CONNECT" {
+        log.Printf("[%s] HTTP CONNECT: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
+        return target, nil, mode, nil
+    } 
     
+    log.Printf("[%s] HTTP Proxy: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
+    mode = 3 // modeHTTPProxy
+    var buf bytes.Buffer
+    req.WriteProxy(&buf)
+    return target, buf.Bytes(), mode, nil
+}
+
+
+// --- Routing & Dispatch ---
+
+func route(target, inboundTag string) string {
+	host, _, _ := net.SplitHostPort(target); if host == "" { host = target }
+	
+	for _, rule := range globalConfig.Routing.Rules {
+		if len(rule.InboundTag) > 0 {
+			match := false
+			for _, t := range rule.InboundTag { if t == inboundTag { match = true; break } }
+			if !match { continue }
+		}
+		if len(rule.Domain) > 0 {
+			for _, d := range rule.Domain { if strings.Contains(host, d) { return rule.OutboundTag } }
+		}
+		if rule.GeoIP == "cn" {
+			if isChinaIPForRouter(net.ParseIP(host)) { return rule.OutboundTag }
+			ips, err := net.LookupIP(host)
+			if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) { return rule.OutboundTag }
+		}
+	}
+	if globalConfig.Routing.DefaultOutbound != "" {
+		return globalConfig.Routing.DefaultOutbound
+	}
+    return "direct"
+}
+
+func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
     outbound, ok := findOutbound(outboundTag)
     if !ok { return }
 
-    // 3. Establish remote connection and forward data
     var err error
     switch outbound.Protocol {
     case "freedom":
-        err = startDirectTunnel(conn, target, nil, true)
+        err = startDirectTunnel(conn, target, firstFrame, mode)
     case "ech-proxy":
-        err = startProxyTunnel(conn, target, outboundTag, nil, true)
+        err = startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
     case "blackhole":
         conn.Close()
         return
     }
     
     if err != nil {
-        log.Printf("[%s] Tunnel failed for %s: %v", inboundTag, target, err)
+        log.Printf("Tunnel failed for %s: %v", target, err)
     }
 }
 
-func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) {
-    reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
-    req, err := http.ReadRequest(reader)
-    if err != nil { return }
+// --- Tunneling Logic ---
 
-    target := req.Host
-    if req.Method == "CONNECT" {
-        log.Printf("[%s] HTTP CONNECT: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
-    } else {
-        log.Printf("[%s] HTTP Proxy: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
-    }
-    
-    outboundTag := route(target, inboundTag)
-    log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
+const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
 
-    outbound, ok := findOutbound(outboundTag)
-    if !ok { return }
-
-    var firstFrame []byte
-    if req.Method != "CONNECT" {
-        var buf bytes.Buffer
-        req.WriteProxy(&buf)
-        firstFrame = buf.Bytes()
-    }
-
-    var tunnelErr error
-    switch outbound.Protocol {
-    case "freedom":
-        tunnelErr = startDirectTunnel(conn, target, firstFrame, req.Method == "CONNECT")
-    case "ech-proxy":
-        tunnelErr = startProxyTunnel(conn, target, outboundTag, firstFrame, req.Method == "CONNECT")
-    case "blackhole":
-        conn.Close()
-        return
-    }
-
-    if tunnelErr != nil {
-        log.Printf("[%s] Tunnel failed for %s: %v", inboundTag, target, tunnelErr)
-    }
-}
-
-
-// --- Tunneling Logic (Rewritten) ---
-
-func startDirectTunnel(local net.Conn, target string, firstFrame []byte, isConnect bool) error {
+func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) error {
     remote, err := net.DialTimeout("tcp", target, 5*time.Second)
     if err != nil {
-        if isConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
+        if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+		if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
         return err
     }
     defer remote.Close()
     
-    if isConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+    if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+    if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
     
     if len(firstFrame) > 0 { remote.Write(firstFrame) }
     go io.Copy(remote, local)
@@ -240,15 +268,15 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, isConne
     return nil
 }
 
-func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, isConnect bool) error {
+func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
     wsConn, err := dialSpecificWebSocket(outboundTag)
     if err != nil {
-        if isConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
+		if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+        if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
         return err
     }
     defer wsConn.Close()
 
-    // X-Link Handshake
     connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
     if err := wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg)); err != nil { return err }
 
@@ -257,18 +285,25 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
         return fmt.Errorf("handshake failed: %s", msg)
     }
     
-    if isConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+    if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+    if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
     
-    // Forward data
     done := make(chan bool, 2)
-    go func() { io.Copy(wsConn.UnderlyingConn(), local); done <- true }()
-    go func() { io.Copy(local, wsConn.UnderlyingConn()); done <- true }()
+    go func() { 
+        io.Copy(wsConn.UnderlyingConn(), local)
+        wsConn.Close()
+        done <- true 
+    }()
+    go func() { 
+        io.Copy(local, wsConn.UnderlyingConn())
+        local.(*net.TCPConn).CloseWrite()
+        done <- true 
+    }()
     <-done
     return nil
 }
 
-
-// ... (dialSpecificWebSocket and Helpers) ...
+// ... (Helpers) ...
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
@@ -310,4 +345,3 @@ func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, 
 	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
 }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
-func (r *Routing) DefaultOutbound() string { return "direct" }
