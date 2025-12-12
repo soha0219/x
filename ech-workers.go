@@ -1,11 +1,11 @@
-// ech-proxy-core.go - v5.0 (X-Link Protocol Kernel)
+// ech-proxy-core.go - v5.1 (X-Link Protocol Kernel - Compile Fixed)
 // 纯净版内核：移除 ECH，使用标准 TLS + WebSocket + 私有握手
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"context"
+	// "context" // 移除
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -51,7 +51,8 @@ type ProxySettings struct { // 简化了设置
 	Token     string `json:"token"`
 }
 type Routing struct {
-	Rules []Rule `json:"rules"`
+	Rules           []Rule `json:"rules"`
+	DefaultOutbound string `json:"defaultOutbound,omitempty"` // 【【核心修正】】
 }
 type Rule struct {
 	InboundTag  []string `json:"inboundTag,omitempty"`
@@ -149,7 +150,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	if err != nil { return }
 
 	outboundTag := route(target, inboundTag)
-	// log.Printf("[%s] Routing %s -> [%s]", inboundTag, target, outboundTag) // 减少日志刷屏
 	dispatch(conn, target, outboundTag, firstFrame, mode)
 }
 
@@ -189,7 +189,13 @@ func route(target, inboundTag string) string {
 			return rule.OutboundTag
 		}
 	}
-	return globalConfig.Routing.DefaultOutbound // Fallback
+	
+	// 【【【核心修正】】】
+	if globalConfig.Routing.DefaultOutbound != "" {
+		return globalConfig.Routing.DefaultOutbound
+	}
+    
+    return "direct" // 最终的回退
 }
 
 func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
@@ -310,19 +316,18 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 	
-	// 标准 TLS 配置，没有任何 ECH 痕迹
+	// 标准 TLS 配置
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
-		ServerName: host, // SNI 正常发送
+		ServerName: host,
 	}
 
 	dialer := websocket.Dialer{
 		TLSClientConfig:  tlsCfg,
 		HandshakeTimeout: 10 * time.Second,
-		Subprotocols:     []string{settings.Token}, // 依然使用 Header 传递 Token
+		Subprotocols:     []string{settings.Token},
 	}
 
-	// 支持指定 IP 连接 (IP 直连模式)
 	if settings.ServerIP != "" {
 		dialer.NetDial = func(n, a string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(a)
@@ -334,11 +339,9 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	return conn, err
 }
 
-// ... (Helpers: findOutbound, loadChinaListsForRouter, parseServerAddr etc.) ...
-// (保持原有的辅助函数，去掉 ECH 相关的即可)
+// ... (Helpers) ...
 func findOutbound(tag string) (Outbound, bool) { for _, ob := range globalConfig.Outbounds { if ob.Tag == tag { return ob, true } }; return Outbound{}, false }
 func getExeDir() string { exePath, err := os.Executable(); if err != nil { return "." }; return filepath.Dir(exePath) }
-var httpClient = &http.Client{ Timeout: 30 * time.Second }
 func ipToUint32(ip net.IP) uint32 { ip = ip.To4(); if ip == nil { return 0 }; return binary.BigEndian.Uint32(ip) }
 func isChinaIPForRouter(ip net.IP) bool { if ip == nil { return false }; if ip4 := ip.To4(); ip4 != nil { val := ipToUint32(ip4); chinaIPRangesMu.RLock(); defer chinaIPRangesMu.RUnlock(); for _, r := range chinaIPRanges { if val >= r.start && val <= r.end { return true } } } else if ip16 := ip.To16(); ip16 != nil { var val [16]byte; copy(val[:], ip16); chinaIPV6RangesMu.RLock(); defer chinaIPV6RangesMu.RUnlock(); for _, r := range chinaIPV6Ranges { if bytes.Compare(val[:], r.start[:]) >= 0 && bytes.Compare(val[:], r.end[:]) <= 0 { return true } } }; return false }
 func loadChinaListsForRouter() { loadIPListForRouter("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false); loadIPListForRouter("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true) }
@@ -365,4 +368,3 @@ func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, 
 	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
 }
 func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
-func (r *Routing) DefaultOutbound() string { return "direct" } // Placeholder
