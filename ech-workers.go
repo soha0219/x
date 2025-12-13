@@ -1,5 +1,5 @@
-// ech-proxy-core.go - v5.4 (Compile Fixed & Final)
-// 协议内核：修复了所有编译错误，并保持了 v5.3 的稳定转发逻辑。
+// ech-proxy-core.go - v5.4 (Final Forwarding Fix)
+// 协议内核：修复了 WebSocket 数据流转发的根本性错误。
 package main
 
 import (
@@ -23,11 +23,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.comcom/gorilla/websocket"
 )
 
 // ======================== Config Structures ========================
-
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -61,7 +60,6 @@ type Rule struct {
 }
 
 // ======================== Global State ========================
-
 var (
 	globalConfig      Config
 	proxySettingsMap  = make(map[string]ProxySettings)
@@ -70,12 +68,10 @@ var (
 	chinaIPRangesMu   sync.RWMutex
 	chinaIPV6RangesMu sync.RWMutex
 )
-
 type ipRange struct { start uint32; end uint32 }
 type ipRangeV6 struct { start [16]byte; end [16]byte }
 
 // ======================== Main Logic ========================
-
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
@@ -104,7 +100,6 @@ func parseOutbounds() {
         }
     }
 }
-
 func runInbound(ib Inbound) {
     listener, err := net.Listen("tcp", ib.Listen)
     if err != nil { log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err); return }
@@ -147,7 +142,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
     
     dispatch(conn, target, outboundTag, firstFrame, mode)
 }
-
 
 // --- Protocol Handlers ---
 
@@ -198,7 +192,6 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
     req.WriteProxy(&buf)
     return target, buf.Bytes(), mode, nil
 }
-
 
 // --- Routing & Dispatch ---
 
@@ -288,20 +281,44 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
     if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
     if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
     
+    // 【【【核心修复】】】 使用正确的 WebSocket 消息转发，而不是 io.Copy
     done := make(chan bool, 2)
+    
     go func() { 
-        io.Copy(wsConn.UnderlyingConn(), local)
-        wsConn.Close()
-        done <- true 
+        buf := make([]byte, 32*1024)
+        for { 
+            n, err := local.Read(buf)
+            if err != nil {
+                wsConn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+                done <- true
+                return 
+            }
+            if err := wsConn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
+                done <- true
+                return
+            }
+        }
     }()
+
     go func() { 
-        io.Copy(local, wsConn.UnderlyingConn())
-        local.(*net.TCPConn).CloseWrite()
-        done <- true 
+        for { 
+            _, msg, err := wsConn.ReadMessage()
+            if err != nil { 
+                local.Close()
+                done <- true
+                return 
+            }
+            if _, err := local.Write(msg); err != nil {
+                done <- true
+                return
+            }
+        } 
     }()
+
     <-done
     return nil
 }
+
 
 // ... (Helpers) ...
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
@@ -344,4 +361,4 @@ func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, 
 	mu.Lock(); defer mu.Unlock()
 	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
 }
-func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
+func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }```
