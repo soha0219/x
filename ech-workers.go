@@ -1,11 +1,11 @@
-// ech-proxy-core.go - v5.6 (De-fingerprinted)
-// 协议内核：通过在真实握手前发送随机噪声包，消除了固定的首包特征。
+// ech-proxy-core.go - v5.7 (Syntax Fix)
+// 协议内核：修正了v5.6版本中的Go语言import语法错误，并保持去指纹特性。
 package main
 
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand" // 【【【核心改动】】】 导入crypto/rand以生成安全的随机噪声
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -15,7 +15,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand" as mathrand // 【【【核心改动】】】 导入math/rand用于非加密的随机数
+	// 【【【核心修正】】】 修正了math/rand包的别名语法
+	mathrand "math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -25,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.comcom/gorilla/websocket"
 )
 
 // ======================== Config Structures ========================
@@ -75,12 +76,11 @@ type ipRangeV6 struct{ start [16]byte; end [16]byte }
 
 // ======================== Main Logic ========================
 func main() {
-	// 【【【核心改动】】】 初始化随机数种子
 	mathrand.Seed(time.Now().UnixNano())
 
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v1.5 (De-fingerprinted) Starting...")
+	log.Println("[Core] X-Link Kernel v1.6 (Syntax Fix) Starting...") // 更新版本号
 	file, err := os.ReadFile(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to read config: %v", err)
@@ -346,7 +346,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	}
 	defer wsConn.Close()
 
-	// 【【【核心改动】】】 在发送真实握手前，发送随机噪声
+	// 保持去指纹特性：在发送真实握手前，发送随机噪声
 	// 发送 1 到 4 个噪声包
 	noiseCount := mathrand.Intn(4) + 1
 	for i := 0; i < noiseCount; i++ {
