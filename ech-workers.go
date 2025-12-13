@@ -1,11 +1,12 @@
-// ech-proxy-core.go - v6.6 (Final Import Fix)
-// 协议内核：修正了 "github.comcom" 的致命拼写错误，解决了最终的编译失败问题。
-// 这是集所有修复于一身、可成功编译的最终版本。
+// ech-proxy-core.go - v7.0 (Back to Basics)
+// 协议内核：移除 uTLS 伪装，回归标准 Go TLS 指纹，强制使用 HTTP/1.1。
+// 保留了 X-Auth-Token 修复以绕过 WAF，保留了 SOCKS5 修复以防止丢包。
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls" // 回归标准库
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,7 +16,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url" 
+	// "net/url" // 不再需要手动解析 URL
 	"os"
 	"path/filepath"
 	"reflect"
@@ -23,8 +24,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket" // 【【【最终修复】】】修正了致命的拼写错误
-	utls "github.com/refraction-networking/utls"
+	"github.com/gorilla/websocket"
+	// utls "github.com/refraction-networking/utls" // 彻底移除 uTLS
 )
 
 // ======================== Config Structures ========================
@@ -76,7 +77,7 @@ type ipRangeV6 struct { start [16]byte; end [16]byte }
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v6.6 (Final Import Fix) Starting...")
+	log.Println("[Core] X-Link Kernel v7.0 (Pure Go TLS) Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -257,6 +258,7 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode in
 }
 
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
+    // SOCKS5 数据预读取修复
     if mode == modeSOCKS5 && len(firstFrame) == 0 {
         local.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
         buffer := make([]byte, 32*1024)
@@ -338,6 +340,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	return nil
 }
 
+// 【【【核心修改】】】回归标准库 Dialer，移除 uTLS
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
@@ -349,42 +352,35 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		return nil, fmt.Errorf("invalid server address: %w", err)
 	}
 	
-	serverAddr := net.JoinHostPort(host, port)
-
-	var dialAddr string
-	if settings.ServerIP != "" {
-		dialAddr = net.JoinHostPort(settings.ServerIP, port)
-	} else {
-		dialAddr = serverAddr
+	// 使用 wss:// 协议，让 websocket 库自动处理标准 TLS 握手
+	// 这样 Go 标准库会自动使用 HTTP/1.1，避免被 Cloudflare 强制升级到 HTTP/2
+	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+	
+	tlsCfg := &tls.Config{ 
+		MinVersion: tls.VersionTLS13, 
+		ServerName: host,
+		// 如果需要，可以在这里加入 InsecureSkipVerify: true
 	}
-
-	dialConn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
-	if err != nil {
-		return nil, err
-	}
-
-	config := &utls.Config{
-		ServerName:         host,
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"http/1.1"},
-	}
-	uconn := utls.UClient(dialConn, config, utls.HelloFirefox_102)
-	if err := uconn.Handshake(); err != nil {
-		return nil, err
-	}
-
-	wsURL := url.URL{Scheme: "ws", Host: serverAddr, Path: path}
-
+	
 	customHeader := http.Header{}
+	// 保留 X-Auth-Token 修复，这是通过 WAF 的关键
 	customHeader.Add("X-Auth-Token", settings.Token)
-	customHeader.Add("Host", host) 
 
-	conn, _, err := websocket.NewClient(uconn, &wsURL, customHeader, 16*1024, 16*1024)
-	if err != nil {
-		return nil, fmt.Errorf("websocket handshake failed: %w", err)
+	dialer := websocket.Dialer{
+		TLSClientConfig:  tlsCfg,
+		HandshakeTimeout: 10 * time.Second,
 	}
 
-	return conn, nil
+	if settings.ServerIP != "" {
+		dialer.NetDial = func(n, a string) (net.Conn, error) {
+			_, p, _ := net.SplitHostPort(a)
+			// 强制连接到指定 IP
+			return net.DialTimeout(n, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
+		}
+	}
+	
+	conn, _, err := dialer.Dial(wsURL, customHeader)
+	return conn, err
 }
 
 func findOutbound(tag string) (Outbound, bool) { 
