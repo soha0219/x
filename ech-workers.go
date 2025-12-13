@@ -1,5 +1,5 @@
-// ech-proxy-core.go - v10.2 (The Final Apology)
-// 协议内核：补回了被错误删除的 "strings" import，解决了最终的编译失败问题。
+// ech-proxy-core.go - v10.3 (The Final Apology)
+// 协议内核：修正了 v10.1 中由于拼写错误 ("global" vs "globalConfig") 导致的致命编译错误。
 // 这是集所有已知修复于一身、经过严格审查、可成功编译的最终版本。
 package main
 
@@ -18,7 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strings" // 【【【最终修复】】】补回被错误删除的 import
+	"strings"
 	"sync"
 	"time"
 
@@ -41,15 +41,18 @@ var proxySettingsMap = make(map[string]ProxySettings)
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v10.2 (Final Apology) Starting...")
+	log.Println("[Core] X-Link Kernel v10.3 (Final Apology) Starting...")
 	
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 
-	var globalConfig Config
-	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
+	var globalConfig Config // Correctly scoped variable
+	if err := json.Unmarshal(file, &globalConfig); err != nil {
+		log.Fatalf("Config parse error: %v", err)
+	}
 
-	for _, outbound := range global.Outbounds {
+	// 【【【最终修复】】】修正了致命的拼写错误 global -> globalConfig
+	for _, outbound := range globalConfig.Outbounds {
 		if outbound.Protocol == "ech-proxy" {
 			var settings ProxySettings
 			if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
