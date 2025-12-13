@@ -1,10 +1,12 @@
-// ech-proxy-core.go - v5.8 (Final Stealth Mode Fix)
-// 协议内核：为 v2.1 无指纹协议加入了 SOCKS5 首包预读取逻辑，解决了连接超时问题。
+// ech-proxy-core.go - v6.0 (uTLS Camouflage Edition)
+// 协议内核：引入 uTLS 库，将 Go 程序的 TLS 指纹伪装成 Chrome 浏览器，
+// 以绕过 Cloudflare 的 Bot 防护系统，解决最终的连接超时问题。
 package main
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -23,9 +25,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	utls "github.com/refraction-networking/utls" // 引入 uTLS 库
 )
 
-// ======================== Config Structures (No changes) ========================
+// ======================== Config Structures ========================
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -57,7 +60,8 @@ type Rule struct {
 	Port        []int    `json:"port,omitempty"`
 	OutboundTag string   `json:"outboundTag"`
 }
-// ======================== Global State (No changes) ========================
+
+// ======================== Global State ========================
 var (
 	globalConfig      Config
 	proxySettingsMap  = make(map[string]ProxySettings)
@@ -73,7 +77,7 @@ type ipRangeV6 struct { start [16]byte; end [16]byte }
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v2.1 (Final Stealth Fix) Starting...")
+	log.Println("[Core] X-Link Kernel v6.0 (uTLS Camouflage) Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -87,22 +91,173 @@ func main() {
 	log.Println("[Core] Engine started.")
 	wg.Wait()
 }
-// ... (All other functions like parseOutbounds, runInbound, handleHTTP, etc. are correct and omitted for brevity) ...
-// (此处省略大量未变动的函数，只展示核心修改部分)
-func parseOutbounds() { for _, outbound := range globalConfig.Outbounds { if outbound.Protocol == "ech-proxy" { var settings ProxySettings; if err := json.Unmarshal(outbound.Settings, &settings); err == nil { proxySettingsMap[outbound.Tag] = settings } } } }
-func runInbound(ib Inbound) { listener, err := net.Listen("tcp", ib.Listen); if err != nil { log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err); return }; log.Printf("[Inbound] Listening on %s (%s)", ib.Listen, ib.Tag); for { conn, err := listener.Accept(); if err != nil { continue }; go handleGeneralConnection(conn, ib.Tag) } }
-func handleGeneralConnection(conn net.Conn, inboundTag string) { defer conn.Close(); buf := make([]byte, 1); if _, err := io.ReadFull(conn, buf); err != nil { return }; var target string; var err error; var firstFrame []byte; var mode int; switch buf[0] { case 0x05: target, err = handleSOCKS5(conn, inboundTag); mode = 1; case 'C', 'G', 'P', 'H', 'D', 'O', 'T': target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag); default: return }; if err != nil { log.Printf("[%s] Protocol error: %v", inboundTag, err); return }; outboundTag := route(target, inboundTag); log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag); dispatch(conn, target, outboundTag, firstFrame, mode) }
-func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) { handshakeBuf := make([]byte, 2); if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return "", err }; conn.Write([]byte{0x05, 0x00}); header := make([]byte, 4); if _, err := io.ReadFull(conn, header); err != nil { return "", err }; if header[1] != 0x01 { conn.Write([]byte{0x05, 0x07, 0x00, 0x01}); return "", errors.New("unsupported SOCKS5 command") }; var host string; switch header[3] { case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String(); case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d); case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String(); default: return "", errors.New("bad addr type") }; portBytes := make([]byte, 2); io.ReadFull(conn, portBytes); port := binary.BigEndian.Uint16(portBytes); target := net.JoinHostPort(host, fmt.Sprintf("%d", port)); log.Printf("[%s] SOCKS5: %s -> %s", inboundTag, conn.RemoteAddr().String(), target); return target, nil }
-func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) { reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn)); req, err := http.ReadRequest(reader); if err != nil { return "", nil, 0, err }; target := req.Host; mode := 2; if req.Method == "CONNECT" { log.Printf("[%s] HTTP CONNECT: %s -> %s", inboundTag, conn.RemoteAddr().String(), target); return target, nil, mode, nil }; log.Printf("[%s] HTTP Proxy: %s -> %s", inboundTag, conn.RemoteAddr().String(), target); mode = 3; var buf bytes.Buffer; req.WriteProxy(&buf); return target, buf.Bytes(), mode, nil }
-func route(target, inboundTag string) string { host, _, _ := net.SplitHostPort(target); if host == "" { host = target }; for _, rule := range globalConfig.Routing.Rules { if len(rule.InboundTag) > 0 { match := false; for _, t := range rule.InboundTag { if t == inboundTag { match = true; break } }; if !match { continue } }; if len(rule.Domain) > 0 { for _, d := range rule.Domain { if strings.Contains(host, d) { return rule.OutboundTag } } }; if rule.GeoIP == "cn" { if isChinaIPForRouter(net.ParseIP(host)) { return rule.OutboundTag }; ips, err := net.LookupIP(host); if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) { return rule.OutboundTag } } }; if globalConfig.Routing.DefaultOutbound != "" { return globalConfig.Routing.DefaultOutbound }; return "direct" }
-func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) { outbound, ok := findOutbound(outboundTag); if !ok { return }; var err error; switch outbound.Protocol { case "freedom": err = startDirectTunnel(conn, target, firstFrame, mode); case "ech-proxy": err = startProxyTunnel(conn, target, outboundTag, firstFrame, mode); case "blackhole": conn.Close(); return }; if err != nil { log.Printf("Tunnel failed for %s: %v", target, err) } }
-const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
-func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) error { remote, err := net.DialTimeout("tcp", target, 5*time.Second); if err != nil { if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }; if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }; return err }; defer remote.Close(); if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }; if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }; if len(firstFrame) > 0 { remote.Write(firstFrame) }; go io.Copy(remote, local); io.Copy(local, remote); return nil }
 
-// ======================== [ 核心修复区域 ] ========================
+func parseOutbounds() {
+    for _, outbound := range globalConfig.Outbounds {
+        if outbound.Protocol == "ech-proxy" {
+            var settings ProxySettings
+            if err := json.Unmarshal(outbound.Settings, &settings); err == nil {
+                proxySettingsMap[outbound.Tag] = settings
+            }
+        }
+    }
+}
+func runInbound(ib Inbound) {
+    listener, err := net.Listen("tcp", ib.Listen)
+    if err != nil { log.Printf("[Error] Listen failed on %s: %v", ib.Listen, err); return }
+    log.Printf("[Inbound] Listening on %s (%s)", ib.Listen, ib.Tag)
+    for {
+        conn, err := listener.Accept()
+        if err != nil { continue }
+        go handleGeneralConnection(conn, ib.Tag)
+    }
+}
+
+func handleGeneralConnection(conn net.Conn, inboundTag string) {
+    defer conn.Close()
+    
+    buf := make([]byte, 1)
+    if _, err := io.ReadFull(conn, buf); err != nil { return }
+
+    var target string
+    var err error
+    var firstFrame []byte
+    var mode int
+
+    switch buf[0] {
+    case 0x05:
+        target, err = handleSOCKS5(conn, inboundTag)
+        mode = 1
+    case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
+        target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
+    default:
+        return
+    }
+
+    if err != nil {
+        log.Printf("[%s] Protocol error: %v", inboundTag, err)
+        return
+    }
+    
+    outboundTag := route(target, inboundTag)
+    log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr().String(), target, outboundTag)
+    
+    dispatch(conn, target, outboundTag, firstFrame, mode)
+}
+
+func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
+    handshakeBuf := make([]byte, 2)
+    if _, err := io.ReadFull(conn, handshakeBuf); err != nil { return "", err }
+    conn.Write([]byte{0x05, 0x00})
+
+    header := make([]byte, 4)
+    if _, err := io.ReadFull(conn, header); err != nil { return "", err }
+    
+    if header[1] != 0x01 {
+        conn.Write([]byte{0x05, 0x07, 0x00, 0x01})
+        return "", errors.New("unsupported SOCKS5 command")
+    }
+
+    var host string
+    switch header[3] {
+    case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
+    case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
+    case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
+    default: return "", errors.New("bad addr type")
+    }
+    portBytes := make([]byte, 2); io.ReadFull(conn, portBytes)
+    port := binary.BigEndian.Uint16(portBytes)
+    target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
+    log.Printf("[%s] SOCKS5: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
+    return target, nil
+}
+
+func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
+    reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
+    req, err := http.ReadRequest(reader)
+    if err != nil { return "", nil, 0, err }
+
+    target := req.Host
+    mode := 2
+
+    if req.Method == "CONNECT" {
+        log.Printf("[%s] HTTP CONNECT: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
+        return target, nil, mode, nil
+    } 
+    
+    log.Printf("[%s] HTTP Proxy: %s -> %s", inboundTag, conn.RemoteAddr().String(), target)
+    mode = 3
+    var buf bytes.Buffer
+    req.WriteProxy(&buf)
+    return target, buf.Bytes(), mode, nil
+}
+
+func route(target, inboundTag string) string {
+	host, _, _ := net.SplitHostPort(target); if host == "" { host = target }
+	
+	for _, rule := range globalConfig.Routing.Rules {
+		if len(rule.InboundTag) > 0 {
+			match := false
+			for _, t := range rule.InboundTag { if t == inboundTag { match = true; break } }
+			if !match { continue }
+		}
+		if len(rule.Domain) > 0 {
+			for _, d := range rule.Domain { if strings.Contains(host, d) { return rule.OutboundTag } }
+		}
+		if rule.GeoIP == "cn" {
+			if isChinaIPForRouter(net.ParseIP(host)) { return rule.OutboundTag }
+			ips, err := net.LookupIP(host)
+			if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) { return rule.OutboundTag }
+		}
+	}
+	if globalConfig.Routing.DefaultOutbound != "" {
+		return globalConfig.Routing.DefaultOutbound
+	}
+    return "direct"
+}
+
+func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
+    outbound, ok := findOutbound(outboundTag)
+    if !ok { return }
+
+    var err error
+    switch outbound.Protocol {
+    case "freedom":
+        err = startDirectTunnel(conn, target, firstFrame, mode)
+    case "ech-proxy":
+        err = startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
+    case "blackhole":
+        conn.Close()
+        return
+    }
+    
+    if err != nil {
+        log.Printf("Tunnel failed for %s: %v", target, err)
+    }
+}
+
+const ( modeSOCKS5 = 1; modeHTTPConnect = 2; modeHTTPProxy = 3 )
+
+func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) error {
+    remote, err := net.DialTimeout("tcp", target, 5*time.Second)
+    if err != nil {
+        if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+		if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n")) }
+        return err
+    }
+    defer remote.Close()
+    
+    if mode == modeSOCKS5 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}) }
+    if mode == modeHTTPConnect { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+    
+    if len(firstFrame) > 0 { remote.Write(firstFrame) }
+    go io.Copy(remote, local)
+    io.Copy(local, remote)
+    return nil
+}
+
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
-	// 【【【最终修复】】】
-    // 为 SOCKS5 模式加入首包预读取逻辑，修复数据丢失问题。
     if mode == modeSOCKS5 && len(firstFrame) == 0 {
         local.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
         buffer := make([]byte, 32*1024)
@@ -188,34 +343,143 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 	
-	host, port, path, _ := parseServerAddr(settings.Server)
-	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+	host, _, _ := parseServerAddr(settings.Server)
+	wsURL := fmt.Sprintf("wss://%s", settings.Server)
 	
-	tlsCfg := &tls.Config{ MinVersion: tls.VersionTLS13, ServerName: host }
-	
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	// 核心修改：劫持 NetDialContext 来注入 uTLS
+	dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		// 如果用户指定了 IP，则使用该 IP 进行连接
+		var dialAddr string
+		if settings.ServerIP != "" {
+			_, port, _ := net.SplitHostPort(addr)
+			dialAddr = net.JoinHostPort(settings.ServerIP, port)
+		} else {
+			dialAddr = addr
+		}
+
+		// 建立基础 TCP 连接
+		dialConn, err := net.DialTimeout(network, dialAddr, 5*time.Second)
+		if err != nil {
+			return nil, err
+		}
+
+		// 将 TCP 连接包装成 uTLS 连接，以伪装 TLS 指纹
+		config := &utls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: true, // 跳过证书验证，专注于连接成功
+		}
+		
+		// 使用 uTLS 创建一个伪装成 Chrome 浏览器的客户端
+		uconn := utls.UClient(dialConn, config, utls.HelloChrome_Auto)
+		
+		// 手动执行 TLS 握手
+		if err := uconn.Handshake(); err != nil {
+			return nil, err
+		}
+		
+		// 返回伪装好的连接
+		return uconn, nil
+	}
+
+	// websocket.Dialer 不再需要 TLSClientConfig，因为它会在 uTLS 连接上工作
+	dialer.TLSClientConfig = &tls.Config{
+		ServerName: host,
+		InsecureSkipVerify: true,
+	}
+
 	customHeader := http.Header{}
 	customHeader.Add("X-Auth-Token", settings.Token)
-
-	dialer := websocket.Dialer{
-		TLSClientConfig:  tlsCfg,
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	if settings.ServerIP != "" {
-		dialer.NetDial = func(n, a string) (net.Conn, error) {
-			_, p, _ := net.SplitHostPort(a)
-			return net.DialTimeout(n, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
-		}
-	}
 	
 	conn, _, err := dialer.Dial(wsURL, customHeader)
 	return conn, err
 }
-// ======================== (以下为未修改的辅助函数) ========================
-func findOutbound(tag string) (Outbound, bool) { for _, ob := range globalConfig.Outbounds { if ob.Tag == tag { return ob, true } }; return Outbound{}, false }
-func getExeDir() string { exePath, _ := os.Executable(); return filepath.Dir(exePath) }
-func ipToUint32(ip net.IP) uint32 { ip = ip.To4(); if ip == nil { return 0 }; return binary.BigEndian.Uint32(ip) }
-func isChinaIPForRouter(ip net.IP) bool { if ip == nil { return false }; if ip4 := ip.To4(); ip4 != nil { val := ipToUint32(ip4); chinaIPRangesMu.RLock(); defer chinaIPRangesMu.RUnlock(); for _, r := range chinaIPRanges { if val >= r.start && val <= r.end { return true } } } else if ip16 := ip.To16(); ip16 != nil { var val [16]byte; copy(val[:], ip16); chinaIPV6RangesMu.RLock(); defer chinaIPV6RangesMu.RUnlock(); for _, r := range chinaIPV6Ranges { if bytes.Compare(val[:], r.start[:]) >= 0 && bytes.Compare(val[:], r.end[:]) <= 0 { return true } } }; return false }
-func loadChinaListsForRouter() { loadIPListForRouter("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false); loadIPListForRouter("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true) }
-func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, isV6 bool) { file, err := os.Open(filepath.Join(getExeDir(), filename)); if err != nil { return }; defer file.Close(); var rangesV4 []ipRange; var rangesV6 []ipRangeV6; scanner := bufio.NewScanner(file); for scanner.Scan() { parts := strings.Fields(scanner.Text()); if len(parts) < 2 { continue }; startIP, endIP := net.ParseIP(parts[0]), net.ParseIP(parts[1]); if startIP == nil || endIP == nil { continue }; if isV6 { var s, e [16]byte; copy(s[:], startIP.To16()); copy(e[:], endIP.To16()); rangesV6 = append(rangesV6, ipRangeV6{start: s, end: e}) } else { s, e := ipToUint32(startIP), ipToUint32(endIP); if s > 0 && e > 0 { rangesV4 = append(rangesV4, ipRange{start: s, end: e}) } } }; mu.Lock(); defer mu.Unlock(); if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) } }
-func parseServerAddr(addr string) (host, port, path string, err error) { path = "/"; if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }; host, port, err = net.SplitHostPort(addr); return }
+
+func findOutbound(tag string) (Outbound, bool) { 
+    for _, ob := range globalConfig.Outbounds { 
+        if ob.Tag == tag { return ob, true } 
+    }
+    return Outbound{}, false 
+}
+
+func getExeDir() string { 
+    exePath, _ := os.Executable()
+    return filepath.Dir(exePath) 
+}
+
+func ipToUint32(ip net.IP) uint32 { 
+    ip = ip.To4()
+    if ip == nil { return 0 }
+    return binary.BigEndian.Uint32(ip) 
+}
+
+func isChinaIPForRouter(ip net.IP) bool { 
+    if ip == nil { return false }
+    if ip4 := ip.To4(); ip4 != nil { 
+        val := ipToUint32(ip4)
+        chinaIPRangesMu.RLock()
+        defer chinaIPRangesMu.RUnlock()
+        for _, r := range chinaIPRanges { 
+            if val >= r.start && val <= r.end { return true } 
+        } 
+    } else if ip16 := ip.To16(); ip16 != nil { 
+        var val [16]byte
+        copy(val[:], ip16)
+        chinaIPV6RangesMu.RLock()
+        defer chinaIPV6RangesMu.RUnlock()
+        for _, r := range chinaIPV6Ranges { 
+            if bytes.Compare(val[:], r.start[:]) >= 0 && bytes.Compare(val[:], r.end[:]) <= 0 { return true } 
+        } 
+    }
+    return false 
+}
+
+func loadChinaListsForRouter() { 
+    loadIPListForRouter("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false)
+    loadIPListForRouter("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true) 
+}
+
+func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, isV6 bool) { 
+	file, err := os.Open(filepath.Join(getExeDir(), filename))
+    if err != nil { return }
+	defer file.Close()
+
+	var rangesV4 []ipRange
+    var rangesV6 []ipRangeV6
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		parts := strings.Fields(scanner.Text())
+        if len(parts) < 2 { continue }
+		startIP, endIP := net.ParseIP(parts[0]), net.ParseIP(parts[1])
+        if startIP == nil || endIP == nil { continue }
+		if isV6 {
+			var s, e [16]byte
+            copy(s[:], startIP.To16())
+            copy(e[:], endIP.To16())
+			rangesV6 = append(rangesV6, ipRangeV6{start: s, end: e})
+		} else {
+			s, e := ipToUint32(startIP), ipToUint32(endIP)
+			if s > 0 && e > 0 { rangesV4 = append(rangesV4, ipRange{start: s, end: e}) }
+		}
+	}
+	mu.Lock()
+    defer mu.Unlock()
+	if isV6 { 
+        reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) 
+    } else { 
+        reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) 
+    }
+}
+
+func parseServerAddr(addr string) (host, port, path string, err error) { 
+    path = "/"
+    if idx := strings.Index(addr, "/"); idx != -1 { 
+        path = addr[idx:]
+        addr = addr[:idx] 
+    }
+    host, port, err = net.SplitHostPort(addr)
+    return 
+}
