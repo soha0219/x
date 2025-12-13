@@ -1,5 +1,5 @@
-// ech-proxy-core.go - v5.7 (Syntax Fix)
-// 协议内核：修正了v5.6版本中的Go语言import语法错误，并保持去指纹特性。
+// ech-proxy-core.go - v5.8 (Import Fix)
+// 协议内核：修正了v5.7版本中 gorilla/websocket 包的 import 路径拼写错误。
 package main
 
 import (
@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	// 【【【核心修正】】】 修正了math/rand包的别名语法
 	mathrand "math/rand"
 	"net"
 	"net/http"
@@ -26,7 +25,8 @@ import (
 	"sync"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	// 【【【核心修正】】】 修正了 websocket 包的 import 路径拼写错误
+	"github.com/gorilla/websocket"
 )
 
 // ======================== Config Structures ========================
@@ -80,7 +80,7 @@ func main() {
 
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v1.6 (Syntax Fix) Starting...") // 更新版本号
+	log.Println("[Core] X-Link Kernel v1.7 (Import Fix) Starting...") // 更新版本号
 	file, err := os.ReadFile(*configPath)
 	if err != nil {
 		log.Fatalf("Failed to read config: %v", err)
@@ -347,18 +347,15 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	defer wsConn.Close()
 
 	// 保持去指纹特性：在发送真实握手前，发送随机噪声
-	// 发送 1 到 4 个噪声包
 	noiseCount := mathrand.Intn(4) + 1
 	for i := 0; i < noiseCount; i++ {
-		// 噪声长度在 50 到 250 字节之间
 		noiseSize := mathrand.Intn(201) + 50
 		noise := make([]byte, noiseSize)
-		rand.Read(noise) // 使用加密安全的随机数填充噪声内容
+		rand.Read(noise)
 
 		if err := wsConn.WriteMessage(websocket.BinaryMessage, noise); err != nil {
 			log.Printf("Warning: failed to send noise packet: %v", err)
 		}
-		// 随机停顿 10-60 毫秒，使行为模式更不规律
 		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
 	}
 
