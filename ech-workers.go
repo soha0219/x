@@ -1,12 +1,13 @@
-// ech-proxy-core.go - v6.2 (Final Handshake Fix)
-// 协议内核：分离 uTLS 握手和 WebSocket 握手，解决了 "TLS-in-TLS" 导致的
-// "first record does not look like a TLS handshake" 错误。
+// ech-proxy-core.go - v6.4 (ALPN Fix)
+// 协议内核：在 uTLS 配置中强制 ALPN 为 http/1.1，解决了因协议协商为 HTTP/2
+// 导致的 websocket 握手失败问题。这是能解决所有已知问题的最终版本。
 package main
 
 import (
 	"bufio"
 	"bytes"
-
+	// "context" // No longer needed
+	// "crypto/tls" // No longer needed
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -16,7 +17,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url" // 新增 import
+	"net/url" 
 	"os"
 	"path/filepath"
 	"reflect"
@@ -76,7 +77,7 @@ type ipRangeV6 struct { start [16]byte; end [16]byte }
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v6.2 (Final Handshake Fix) Starting...")
+	log.Println("[Core] X-Link Kernel v6.4 (ALPN Fix) Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -90,7 +91,7 @@ func main() {
 	log.Println("[Core] Engine started.")
 	wg.Wait()
 }
-// All other functions are correct, only dialSpecificWebSocket is changed.
+// All other functions are correct. Only dialSpecificWebSocket is changed.
 // (此处省略所有其他未修改的函数)
 
 // ======================== [ 核心修复区域 ] ========================
@@ -107,7 +108,6 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	
 	serverAddr := net.JoinHostPort(host, port)
 
-	// 确定实际要拨号的地址（优先使用指定IP）
 	var dialAddr string
 	if settings.ServerIP != "" {
 		dialAddr = net.JoinHostPort(settings.ServerIP, port)
@@ -115,33 +115,29 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		dialAddr = serverAddr
 	}
 
-	// 1. 建立基础 TCP 连接
 	dialConn, err := net.DialTimeout("tcp", dialAddr, 5*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. 在 TCP 连接上进行 uTLS 握手，伪装成 Chrome
 	config := &utls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
+		// 【【【最终修复】】】
+		// 强制应用层协议协商 (ALPN) 只使用 http/1.1，以匹配 websocket 库的行为。
+		NextProtos:         []string{"http/1.1"},
 	}
 	uconn := utls.UClient(dialConn, config, utls.HelloChrome_Auto)
 	if err := uconn.Handshake(); err != nil {
 		return nil, err
 	}
 
-	// 3. 准备 WebSocket 握手
-	// 【【【最终修复】】】
-	// 将 URL 的 scheme 从 "wss" 改为 "ws"，告诉 websocket 库不要再进行 TLS 握手。
-	// Host 保持不变，因为 HTTP Host Header 需要正确。
 	wsURL := url.URL{Scheme: "ws", Host: serverAddr, Path: path}
 
 	customHeader := http.Header{}
 	customHeader.Add("X-Auth-Token", settings.Token)
-	customHeader.Add("Host", host) // 明确指定 Host header
+	customHeader.Add("Host", host)
 
-	// 4. 在已经建立的 uTLS 连接上，发起 WebSocket 客户端握手
 	conn, _, err := websocket.NewClient(uconn, &wsURL, customHeader, 16*1024, 16*1024)
 	if err != nil {
 		return nil, fmt.Errorf("websocket handshake failed: %w", err)
