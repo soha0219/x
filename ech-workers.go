@@ -1,6 +1,6 @@
-// ech-proxy-core.go - v6.0 (uTLS Camouflage Edition)
-// 协议内核：引入 uTLS 库，将 Go 程序的 TLS 指纹伪装成 Chrome 浏览器，
-// 以绕过 Cloudflare 的 Bot 防护系统，解决最终的连接超时问题。
+// ech-proxy-core.go - v6.1 (Final Syntax Fix)
+// 协议内核：修正了 v6.0 中调用 parseServerAddr 函数时的 "assignment mismatch" 编译错误。
+// 这是集所有修复于一身的最终版本。
 package main
 
 import (
@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	utls "github.com/refraction-networking/utls" // 引入 uTLS 库
+	utls "github.com/refraction-networking/utls"
 )
 
 // ======================== Config Structures ========================
@@ -77,7 +77,7 @@ type ipRangeV6 struct { start [16]byte; end [16]byte }
 func main() {
 	configPath := flag.String("c", "config.json", "Path to config")
 	flag.Parse()
-	log.Println("[Core] X-Link Kernel v6.0 (uTLS Camouflage) Starting...")
+	log.Println("[Core] X-Link Kernel v6.1 (Final Fix) Starting...")
 	file, err := os.ReadFile(*configPath)
 	if err != nil { log.Fatalf("Failed to read config: %v", err) }
 	if err := json.Unmarshal(file, &globalConfig); err != nil { log.Fatalf("Config parse error: %v", err) }
@@ -343,15 +343,18 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok { return nil, errors.New("settings not found") }
 	
-	host, _, _ := parseServerAddr(settings.Server)
+	// 【【【最终修复】】】使用 4 个变量来接收 parseServerAddr 的 4 个返回值
+	host, _, _, err := parseServerAddr(settings.Server)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server address: %w", err)
+	}
+
 	wsURL := fmt.Sprintf("wss://%s", settings.Server)
 	
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
 
-	// 核心修改：劫持 NetDialContext 来注入 uTLS
 	dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// 如果用户指定了 IP，则使用该 IP 进行连接
 		var dialAddr string
 		if settings.ServerIP != "" {
 			_, port, _ := net.SplitHostPort(addr)
@@ -360,31 +363,25 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 			dialAddr = addr
 		}
 
-		// 建立基础 TCP 连接
 		dialConn, err := net.DialTimeout(network, dialAddr, 5*time.Second)
 		if err != nil {
 			return nil, err
 		}
 
-		// 将 TCP 连接包装成 uTLS 连接，以伪装 TLS 指纹
 		config := &utls.Config{
 			ServerName:         host,
-			InsecureSkipVerify: true, // 跳过证书验证，专注于连接成功
+			InsecureSkipVerify: true,
 		}
 		
-		// 使用 uTLS 创建一个伪装成 Chrome 浏览器的客户端
 		uconn := utls.UClient(dialConn, config, utls.HelloChrome_Auto)
 		
-		// 手动执行 TLS 握手
 		if err := uconn.Handshake(); err != nil {
 			return nil, err
 		}
 		
-		// 返回伪装好的连接
 		return uconn, nil
 	}
 
-	// websocket.Dialer 不再需要 TLSClientConfig，因为它会在 uTLS 连接上工作
 	dialer.TLSClientConfig = &tls.Config{
 		ServerName: host,
 		InsecureSkipVerify: true,
