@@ -4,7 +4,7 @@ package core
 import (
 	"bufio"
 	"bytes"
-	"crypto/rand" // 【关键修复】补全了 crypto/rand 包
+	"crypto/rand" // 【关键修复】用于加密级随机数
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	mathrand "math/rand" // 别名 mathrand 用于伪随机数
+	mathrand "math/rand" // 【关键修复】别名避免冲突
 	"net"
 	"net/http"
 	"os"
@@ -42,7 +42,6 @@ type Outbound struct {
 	Protocol string          `json:"protocol"`
 	Settings json.RawMessage `json:"settings,omitempty"`
 }
-// [适配] 对应 C++ 生成的 JSON 字段
 type ProxySettings struct {
 	Server    string `json:"server"`
 	ServerIP  string `json:"server_ip,omitempty"`
@@ -75,7 +74,6 @@ var (
 type ipRange struct{ start uint32; end uint32 }
 type ipRangeV6 struct{ start [16]byte; end [16]byte }
 
-// wsWriter 辅助
 type wsWriter struct{ *websocket.Conn }
 
 func (w wsWriter) Write(p []byte) (int, error) {
@@ -88,7 +86,6 @@ func (w wsWriter) Write(p []byte) (int, error) {
 
 // ======================== 核心逻辑 ========================
 
-// 构建二进制握手帧
 func buildBinaryHandshakeFrame(target string, firstFrame []byte) ([]byte, error) {
 	host, portStr, err := net.SplitHostPort(target)
 	if err != nil {
@@ -125,7 +122,6 @@ func buildBinaryHandshakeFrame(target string, firstFrame []byte) ([]byte, error)
 	return finalFrame.Bytes(), nil
 }
 
-// 启动实例
 func StartInstance(configContent []byte) (net.Listener, error) {
 	proxySettingsMap = make(map[string]ProxySettings)
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil {
@@ -138,13 +134,11 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 		return nil, errors.New("no inbounds configured")
 	}
 
-	// 支持多端口监听
 	var listeners []net.Listener
 	for _, inbound := range globalConfig.Inbounds {
 		listener, err := net.Listen("tcp", inbound.Listen)
 		if err != nil {
 			log.Printf("[Error] Listen failed on %s: %v", inbound.Listen, err)
-			// 关闭已开启的
 			for _, l := range listeners { l.Close() }
 			return nil, err
 		}
@@ -167,15 +161,12 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 }
 
 type multiListener struct { listeners []net.Listener }
-func (ml *multiListener) Accept() (net.Conn, error) { return nil, nil } // Not used
+func (ml *multiListener) Accept() (net.Conn, error) { return nil, nil }
 func (ml *multiListener) Close() error {
 	for _, l := range ml.listeners { l.Close() }
 	return nil
 }
-func (ml *multiListener) Addr() net.Addr { 
-    if len(ml.listeners) > 0 { return ml.listeners[0].Addr() }
-    return nil 
-}
+func (ml *multiListener) Addr() net.Addr { if len(ml.listeners) > 0 { return ml.listeners[0].Addr() }; return nil }
 
 func parseOutbounds() {
 	for _, outbound := range globalConfig.Outbounds {
@@ -197,7 +188,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int // 1:SOCKS5, 2:HTTP Connect, 3:HTTP Proxy
+	var mode int
 
 	switch buf[0] {
 	case 0x05:
@@ -263,13 +254,11 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	return target, buf.Bytes(), mode, nil
 }
 
-// 路由逻辑
 func route(target, inboundTag string) string {
 	host, _, _ := net.SplitHostPort(target)
 	if host == "" {
 		host = target
 	}
-	// 1. 遍历规则
 	for _, rule := range globalConfig.Routing.Rules {
 		if len(rule.InboundTag) > 0 {
 			match := false
@@ -294,14 +283,14 @@ func route(target, inboundTag string) string {
 			if isChinaIPForRouter(net.ParseIP(host)) {
 				return rule.OutboundTag
 			}
-			// 简单的DNS查询以检查IP (生产环境应有缓存)
+			// 简单的 DNS 检查，如果失败则跳过而不是报错
 			ips, err := net.LookupIP(host)
 			if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) {
 				return rule.OutboundTag
 			}
 		}
 	}
-	// 2. 默认出口
+	// 如果没有任何规则匹配，返回默认出口
 	if globalConfig.Routing.DefaultOutbound != "" {
 		return globalConfig.Routing.DefaultOutbound
 	}
@@ -334,7 +323,6 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode in
 		return err
 	}
 	defer remote.Close()
-	// 响应本地
 	if mode == 1 {
 		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	} else if mode == 2 {
@@ -355,13 +343,11 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	}
 	defer wsConn.Close()
 
-	// 混淆流量 (使用 mathrand)
 	noiseCount := mathrand.Intn(4) + 1
 	for i := 0; i < noiseCount; i++ {
 		noiseSize := mathrand.Intn(201) + 50
 		noise := make([]byte, noiseSize)
-		// 加密安全的随机数填充 (使用 crypto/rand)
-		rand.Read(noise) 
+		rand.Read(noise) // 使用 crypto/rand
 		wsConn.WriteMessage(websocket.BinaryMessage, noise)
 		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
 	}
@@ -408,7 +394,6 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	return nil
 }
 
-// [核心适配] 使用 ECH 域名进行 TLS 握手
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
@@ -416,7 +401,6 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	}
 	host, port, path, _ := parseServerAddr(settings.Server)
 
-	// 如果设置了 ECH 域名，则 SNI 使用 ECH 域名，否则使用服务地址
 	sni := host
 	if settings.EchDomain != "" {
 		sni = settings.EchDomain
@@ -431,7 +415,6 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		Subprotocols:     []string{settings.Token},
 	}
 
-	// 如果指定了 IP，强制解析到该 IP
 	if settings.ServerIP != "" {
 		dialer.NetDial = func(n, a string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(a)
