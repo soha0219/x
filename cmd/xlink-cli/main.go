@@ -1,84 +1,57 @@
-// cmd/xlink-cli/main.go (v1.1 - Listen Port Support)
+// cmd/xlink-cli/main.go (v2.0 - Config File Support)
 package main
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"os/signal"
-	"strings"
+	"path/filepath"
 	"syscall"
-	"time"
 
-	"xlink-project/core"
+	// 確保這個導入路徑與您的項目結構匹配
+	"xlink-project/core" 
 )
 
-func parseXlinkURI(uri string) ([]byte, error) {
-	if !strings.HasPrefix(uri, "xlink://") {
-		return nil, fmt.Errorf("invalid xlink uri scheme")
-	}
-	fakeURL := "http://" + uri[8:]
-	parsed, err := url.Parse(fakeURL)
-	if err != nil {
-		return nil, err
-	}
-	
-	token, _ := parsed.User.Password()
-	if token == "" {
-		token = parsed.User.Username()
-	}
-	server := parsed.Host
-	queryParams := parsed.Query()
-	secretKey := queryParams.Get("key")
-	fallbackIP := queryParams.Get("fallback")
-	serverIP := queryParams.Get("ip")
-	
-	// 【【【核心改动 1】】】 解析 listen 参数，并提供默认值
-	listenAddr := queryParams.Get("listen")
-	if listenAddr == "" {
-		listenAddr = "127.0.0.1:1080" // 如果 URI 中没有 listen 参数，则默认为 1080
-	}
-
-	// ... (Token 加密和 Config 构建逻辑保持不变) ...
-	tokenPayload := map[string]interface{}{ "p":  token, "fb": fallbackIP, "ts": time.Now().Unix(), }
-	payloadBytes, _ := json.Marshal(tokenPayload)
-	if secretKey != "" { for i := 0; i < len(payloadBytes); i++ { payloadBytes[i] ^= secretKey[i%len(secretKey)] } }
-	encodedToken := base64.StdEncoding.EncodeToString(payloadBytes)
-	config := map[string]interface{}{
-		"inbounds": []map[string]string{
-			// 【【【核心改动 2】】】 使用从 URI 解析出的 listenAddr
-			{"tag": "inbound-0", "listen": listenAddr, "protocol": "socks"},
-		},
-		"outbounds": []map[string]interface{}{
-			{"tag": "direct", "protocol": "freedom"},
-			{"tag": "block", "protocol": "blackhole"},
-			{ "tag": "proxy", "protocol": "ech-proxy", "settings": map[string]string{ "server": server, "server_ip": serverIP, "token": encodedToken, }, },
-		},
-		"routing": map[string]interface{}{ "rules": []interface{}{}, "defaultOutbound": "proxy", },
-	}
-
-	return json.MarshalIndent(config, "", "  ")
-}
+// parseXlinkURI 函數已經不再需要，可以完全刪除。
+// 我們不再從 URI 生成配置，而是直接讀取配置文件。
 
 func main() {
-    // main 函数完全保持不变
-	uri := flag.String("uri", "", "xlink:// connection string")
+	// 1. 修改命令行參數：從 -uri 改為 -c (config)
+	// 默認值可以設置為程序目錄下的 config.json
+	exePath, _ := os.Executable()
+	defaultConfigPath := filepath.Join(filepath.Dir(exePath), "config.json")
+
+	configFile := flag.String("c", defaultConfigPath, "Path to the configuration file (e.g., config.json)")
 	flag.Parse()
-	if *uri == "" { log.Fatalf("Usage: %s -uri <xlink://...>", os.Args[0]) }
-	log.Println("[CLI] Parsing URI and generating config...")
-	configBytes, err := parseXlinkURI(*uri)
-	if err != nil { log.Fatalf("[CLI] Failed to parse URI: %v", err) }
+
+	if *configFile == "" {
+		log.Fatalf("Usage: %s -c <path/to/config.json>", os.Args[0])
+	}
+	log.Printf("[CLI] Loading configuration from: %s", *configFile)
+
+	// 2. 讀取配置文件內容
+	configBytes, err := os.ReadFile(*configFile)
+	if err != nil {
+		log.Fatalf("[CLI] Failed to read config file: %v", err)
+	}
+
+	// 3. 直接將配置文件內容傳遞給核心
 	log.Println("[CLI] Starting X-Link Core Engine...")
 	listener, err := core.StartInstance(configBytes)
-	if err != nil { log.Fatalf("[CLI] Failed to start core engine: %v", err) }
+	if err != nil {
+		log.Fatalf("[CLI] Failed to start core engine: %v", err)
+	}
+
 	log.Println("[CLI] Engine running successfully.")
+
+	// 優雅地關閉進程 (保持不變)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
+
 	log.Println("[CLI] Shutting down...")
-	listener.Close()
+	if listener != nil {
+		listener.Close()
+	}
 }
