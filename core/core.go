@@ -1,4 +1,4 @@
-// core/core.go (v1.4.1 - Import Fix)
+// core/core.go (v5.1 Aligned)
 package core
 
 import (
@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
-	// 【【【核心修正】】】 移除了未使用的 base64 包
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -43,10 +42,14 @@ type Outbound struct {
 	Protocol string          `json:"protocol"`
 	Settings json.RawMessage `json:"settings,omitempty"`
 }
+// [改动] 扩展ProxySettings以支持新功能
 type ProxySettings struct {
-	Server   string `json:"server"`
-	ServerIP string `json:"server_ip"`
-	Token    string `json:"token"`
+	Server     string `json:"server"`
+	ServerIP   string `json:"server_ip,omitempty"`
+	Token      string `json:"token"`
+	EchDomain  string `json:"ech_domain,omitempty"`  // 新增：ECH域名 (用于TLS SNI)
+	DnsWorker  string `json:"dns_worker,omitempty"`  // 新增：首选DOH
+	DnsPublic  string `json:"dns_public,omitempty"`  // 新增：备用DOH
 }
 type Routing struct {
 	Rules           []Rule `json:"rules"`
@@ -111,19 +114,50 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	loadChinaListsForRouter()
 	parseOutbounds()
 	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds configured") }
-	inbound := globalConfig.Inbounds[0]
-	listener, err := net.Listen("tcp", inbound.Listen)
-	if err != nil { log.Printf("[Error] Listen failed on %s: %v", inbound.Listen, err); return nil, err }
-	log.Printf("[Inbound] Listening on %s (%s)", inbound.Listen, inbound.Tag)
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil { log.Printf("[Core] Listener closed on %s: %v", inbound.Listen, err); break }
-			go handleGeneralConnection(conn, inbound.Tag)
+	
+	// 支持多inbound
+	var listeners []net.Listener
+	for _, inbound := range globalConfig.Inbounds {
+		listener, err := net.Listen("tcp", inbound.Listen)
+		if err != nil {
+			log.Printf("[Error] Listen failed on %s: %v", inbound.Listen, err)
+			for _, l := range listeners { l.Close() } // 清理已打开的
+			return nil, err
 		}
-	}()
-	return listener, nil
+		log.Printf("[Inbound] Listening on %s (%s)", inbound.Listen, inbound.Tag)
+		listeners = append(listeners, listener)
+		go func(l net.Listener, tag string) {
+			for {
+				conn, err := l.Accept()
+				if err != nil { log.Printf("[Core] Listener closed on %s: %v", l.Addr().String(), err); break }
+				go handleGeneralConnection(conn, tag)
+			}
+		}(listener, inbound.Tag)
+	}
+
+	// 返回一个聚合的Listener用于关闭
+	return &multiListener{listeners: listeners}, nil
 }
+
+// multiListener to handle multiple listeners shutdown
+type multiListener struct {
+    listeners []net.Listener
+}
+func (ml *multiListener) Accept() (net.Conn, error) { return nil, errors.New("not implemented") }
+func (ml *multiListener) Close() error {
+    var err error
+    for _, l := range ml.listeners {
+        if e := l.Close(); e != nil {
+            err = e
+        }
+    }
+    return err
+}
+func (ml *multiListener) Addr() net.Addr {
+    if len(ml.listeners) > 0 { return ml.listeners[0].Addr() }
+    return nil
+}
+
 
 func parseOutbounds() {
 	for _, outbound := range globalConfig.Outbounds {
@@ -263,14 +297,29 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	return nil
 }
 
+// [改动] dialSpecificWebSocket函数现在会使用EchDomain作为SNI
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]; if !ok { return nil, errors.New("settings not found") }
 	host, port, path, _ := parseServerAddr(settings.Server)
+	
+	// 如果设置了ECH域名，则优先使用它作为TLS握手的SNI
+	sni := host
+	if settings.EchDomain != "" {
+		sni = settings.EchDomain
+	}
+
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
-	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: host}
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: sni} // 使用sni变量
+	
 	dialer := websocket.Dialer{TLSClientConfig: tlsCfg, HandshakeTimeout: 10 * time.Second, Subprotocols: []string{settings.Token}}
+	
+    // DOH的实现较为复杂，此处内核简化处理，主要依赖ServerIP。
+    // DOH参数主要用于告知服务器端如何解析域名。
 	if settings.ServerIP != "" {
-		dialer.NetDial = func(n, a string) (net.Conn, error) { _, p, _ := net.SplitHostPort(a); return net.DialTimeout(n, net.JoinHostPort(settings.ServerIP, p), 5*time.Second) }
+		dialer.NetDial = func(n, a string) (net.Conn, error) { 
+            _, p, _ := net.SplitHostPort(a)
+            return net.DialTimeout(n, net.JoinHostPort(settings.ServerIP, p), 5*time.Second) 
+        }
 	}
 	conn, _, err := dialer.Dial(wsURL, nil)
 	return conn, err
