@@ -1,8 +1,10 @@
+// core/core.go (v5.1 Final Fixed)
 package core
 
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand" // 【关键修复】补全了 crypto/rand 包
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -10,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	mathrand "math/rand"
+	mathrand "math/rand" // 别名 mathrand 用于伪随机数
 	"net"
 	"net/http"
 	"os"
@@ -170,7 +172,10 @@ func (ml *multiListener) Close() error {
 	for _, l := range ml.listeners { l.Close() }
 	return nil
 }
-func (ml *multiListener) Addr() net.Addr { return nil }
+func (ml *multiListener) Addr() net.Addr { 
+    if len(ml.listeners) > 0 { return ml.listeners[0].Addr() }
+    return nil 
+}
 
 func parseOutbounds() {
 	for _, outbound := range globalConfig.Outbounds {
@@ -215,7 +220,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 }
 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
-	// ... (SOCKS5 握手逻辑保持不变)
 	handshakeBuf := make([]byte, 2)
 	io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
@@ -351,12 +355,13 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	}
 	defer wsConn.Close()
 
-	// 混淆流量
+	// 混淆流量 (使用 mathrand)
 	noiseCount := mathrand.Intn(4) + 1
 	for i := 0; i < noiseCount; i++ {
 		noiseSize := mathrand.Intn(201) + 50
 		noise := make([]byte, noiseSize)
-		rand.Read(noise)
+		// 加密安全的随机数填充 (使用 crypto/rand)
+		rand.Read(noise) 
 		wsConn.WriteMessage(websocket.BinaryMessage, noise)
 		time.Sleep(time.Duration(mathrand.Intn(51)+10) * time.Millisecond)
 	}
