@@ -142,7 +142,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 	log.Printf("[%s] Connecting -> %s", inboundTag, target)
 	
-	// Smart Fallback Logic
 	wsConn, proto, err := tryConnect(target, "proxy", firstFrame, true)
 	if err != nil {
 		log.Printf("[Info] Binary failed (%v), switching to JSON...", err)
@@ -171,7 +170,8 @@ func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil { return nil, "", err }
 
-	wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// [关键修复] 将握手超时从 3秒 增加到 15秒，给 SOCKS5 链路留足时间
+	wsConn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	defer wsConn.SetReadDeadline(time.Time{})
 
 	if useBinary {
@@ -193,8 +193,12 @@ func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (
 			wsConn.Close(); return nil, "", err
 		}
 		_, msg, err := wsConn.ReadMessage()
-		if err != nil || len(msg) < 2 || msg[0] != 0x01 || msg[1] != 0x00 {
-			wsConn.Close(); return nil, "", fmt.Errorf("binary handshake rejected")
+		// [优化] 增加错误日志
+		if err != nil {
+			wsConn.Close(); return nil, "", fmt.Errorf("read handshake failed: %v", err)
+		}
+		if len(msg) < 2 || msg[0] != 0x01 || msg[1] != 0x00 {
+			wsConn.Close(); return nil, "", fmt.Errorf("binary handshake rejected (resp: %x)", msg)
 		}
 		return wsConn, "binary", nil
 
@@ -297,9 +301,8 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
-		HandshakeTimeout: 5 * time.Second,
+		HandshakeTimeout: 10 * time.Second, // 增加连接超时
 	}
-	// [修复] 只有当 Token 不为空时才添加子协议，避免空协议头导致某些服务器报错
 	if settings.Token != "" {
 		dialer.Subprotocols = []string{settings.Token}
 	}
