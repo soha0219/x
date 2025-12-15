@@ -1,3 +1,4 @@
+// core/core.go (修复版 - 添加 Cloudflare 必要的伪装头)
 package core
 
 import (
@@ -13,7 +14,7 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
+	"net/http" // 必须引入 net/http 以使用 http.Header
 	"strings"
 	"time"
 
@@ -64,15 +65,7 @@ type Rule struct {
 var (
 	globalConfig     Config
 	proxySettingsMap = make(map[string]ProxySettings)
-	// 暂时注释掉路由相关的全局变量，以解决 unused 报错
-	// chinaIPRanges     []ipRange
-	// chinaIPV6Ranges   []ipRangeV6
-	// chinaIPRangesMu   sync.RWMutex
-	// chinaIPV6RangesMu sync.RWMutex
 )
-
-// type ipRange struct{ start uint32; end uint32 }
-// type ipRangeV6 struct{ start [16]byte; end [16]byte }
 
 // ======================== Core Logic ========================
 
@@ -107,9 +100,6 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil {
 		return nil, fmt.Errorf("config parse error: %w", err)
 	}
-	
-	// 暂时禁用 IP 库加载，避免依赖本地文件
-	// loadChinaListsForRouter()
 	
 	parseOutbounds()
 
@@ -173,11 +163,7 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		return
 	}
 
-	// 简单路由：直接查找名为 "proxy" 的 outbound
-	// 暂时禁用复杂路由以精简依赖
 	outboundTag := "proxy"
-	// outboundTag = route(target, inboundTag)
-
 	log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr(), target, outboundTag)
 	dispatch(conn, target, outboundTag, firstFrame, mode)
 }
@@ -276,6 +262,7 @@ func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode in
 	io.Copy(local, remote)
 }
 
+// 【关键修复】确保此处逻辑与 v2.1 JS 服务端匹配
 func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil {
@@ -283,6 +270,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	}
 	defer wsConn.Close()
 
+	// 1. 发送 JSON 握手包
 	connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
 	jsonHandshake, _ := wrapAsJson([]byte(connectMsg))
 
@@ -290,6 +278,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		return err
 	}
 
+	// 2. 等待服务端 JSON 响应 "X-LINK-OK"
 	_, msg, err := wsConn.ReadMessage()
 	if err != nil {
 		return err
@@ -300,6 +289,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		return fmt.Errorf("handshake failed")
 	}
 
+	// 3. 通知本地连接成功
 	if mode == 1 {
 		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	}
@@ -307,6 +297,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 	}
 
+	// 4. 数据流转发
 	done := make(chan bool, 2)
 
 	go func() {
@@ -342,6 +333,7 @@ func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []b
 	return nil
 }
 
+// 【关键修复】添加 HTTP Headers 以骗过 Cloudflare
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
@@ -350,6 +342,12 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+
+	// 【修复点】构建伪装头
+	requestHeader := http.Header{}
+	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
+	requestHeader.Add("Host", host)
 
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
@@ -363,7 +361,8 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		}
 	}
 
-	conn, _, err := dialer.Dial(wsURL, nil)
+	// 传入 requestHeader
+	conn, _, err := dialer.Dial(wsURL, requestHeader)
 	return conn, err
 }
 
@@ -381,69 +380,3 @@ func parseServerAddr(addr string) (host, port, path string, err error) {
 	}
 	return
 }
-
-/*
-// 暂时注释掉路由和 IP 加载逻辑，避免 os, path/filepath, reflect, sync 等未使用包的引用错误
-// 如果未来需要恢复，请确保取消注释上面的 imports
-
-func route(target, inboundTag string) string {
-	host, _, _ := net.SplitHostPort(target); if host == "" { host = target }
-	for _, rule := range globalConfig.Routing.Rules {
-		if len(rule.InboundTag) > 0 {
-			match := false; for _, t := range rule.InboundTag { if t == inboundTag { match = true; break } }; if !match { continue }
-		}
-		if len(rule.Domain) > 0 { for _, d := range rule.Domain { if strings.Contains(host, d) { return rule.OutboundTag } } }
-		if rule.GeoIP == "cn" {
-			if isChinaIPForRouter(net.ParseIP(host)) { return rule.OutboundTag }
-			ips, err := net.LookupIP(host); if err == nil && len(ips) > 0 && isChinaIPForRouter(ips[0]) { return rule.OutboundTag }
-		}
-	}
-	if globalConfig.Routing.DefaultOutbound != "" { return globalConfig.Routing.DefaultOutbound }
-	return "direct"
-}
-
-func getExeDir() string {
-	exePath, _ := os.Executable(); return filepath.Dir(exePath)
-}
-
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4(); if ip == nil { return 0 }; return binary.BigEndian.Uint32(ip)
-}
-
-func isChinaIPForRouter(ip net.IP) bool {
-	if ip == nil { return false }
-	if ip4 := ip.To4(); ip4 != nil {
-		val := ipToUint32(ip4); chinaIPRangesMu.RLock(); defer chinaIPRangesMu.RUnlock()
-		for _, r := range chinaIPRanges { if val >= r.start && val <= r.end { return true } }
-	} else if ip16 := ip.To16(); ip16 != nil {
-		var val [16]byte; copy(val[:], ip16); chinaIPV6RangesMu.RLock(); defer chinaIPV6RangesMu.RUnlock()
-		for _, r := range chinaIPV6Ranges { if bytes.Compare(val[:], r.start[:]) >= 0 && bytes.Compare(val[:], r.end[:]) <= 0 { return true } }
-	}
-	return false
-}
-
-func loadChinaListsForRouter() {
-	loadIPListForRouter("chn_ip.txt", &chinaIPRanges, &chinaIPRangesMu, false)
-	loadIPListForRouter("chn_ip_v6.txt", &chinaIPV6Ranges, &chinaIPV6RangesMu, true)
-}
-
-func loadIPListForRouter(filename string, target interface{}, mu *sync.RWMutex, isV6 bool) {
-	file, err := os.Open(filepath.Join(getExeDir(), filename)); if err != nil { return }
-	defer file.Close()
-	var rangesV4 []ipRange; var rangesV6 []ipRangeV6
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		parts := strings.Fields(scanner.Text()); if len(parts) < 2 { continue }
-		startIP, endIP := net.ParseIP(parts[0]), net.ParseIP(parts[1]); if startIP == nil || endIP == nil { continue }
-		if isV6 {
-			var s, e [16]byte; copy(s[:], startIP.To16()); copy(e[:], endIP.To16())
-			rangesV6 = append(rangesV6, ipRangeV6{start: s, end: e})
-		} else {
-			s, e := ipToUint32(startIP), ipToUint32(endIP)
-			if s > 0 && e > 0 { rangesV4 = append(rangesV4, ipRange{start: s, end: e}) }
-		}
-	}
-	mu.Lock(); defer mu.Unlock()
-	if isV6 { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV6)) } else { reflect.ValueOf(target).Elem().Set(reflect.ValueOf(rangesV4)) }
-}
-*/
