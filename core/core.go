@@ -1,4 +1,4 @@
-// core/core.go (修复版 - 添加 Cloudflare 必要的伪装头)
+// core/core.go (Debug Version)
 package core
 
 import (
@@ -14,14 +14,13 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http" // 必须引入 net/http 以使用 http.Header
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// JsonEnvelope 用于 WebSocket 消息封装
 type JsonEnvelope struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
@@ -29,7 +28,6 @@ type JsonEnvelope struct {
 	Data string `json:"data"`
 }
 
-// ======================== Config Structures ========================
 type Config struct {
 	Inbounds  []Inbound  `json:"inbounds"`
 	Outbounds []Outbound `json:"outbounds"`
@@ -67,8 +65,6 @@ var (
 	proxySettingsMap = make(map[string]ProxySettings)
 )
 
-// ======================== Core Logic ========================
-
 func wrapAsJson(payload []byte) ([]byte, error) {
 	idBytes := make([]byte, 4)
 	rand.Read(idBytes)
@@ -84,41 +80,30 @@ func wrapAsJson(payload []byte) ([]byte, error) {
 func unwrapFromJson(rawMsg []byte) ([]byte, error) {
 	var envelope JsonEnvelope
 	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
-		return nil, fmt.Errorf("not a valid json envelope: %w", err)
+		return nil, fmt.Errorf("invalid json: %w", err)
 	}
-	if envelope.Type == "pong" {
-		return nil, nil
-	}
-	if envelope.Type != "sync_data" {
-		return nil, errors.New("not a sync_data type message")
-	}
+	if envelope.Type == "pong" { return nil, nil }
+	if envelope.Type != "sync_data" { return nil, errors.New("not sync_data") }
 	return base64.StdEncoding.DecodeString(envelope.Data)
 }
 
 func StartInstance(configContent []byte) (net.Listener, error) {
 	proxySettingsMap = make(map[string]ProxySettings)
 	if err := json.Unmarshal(configContent, &globalConfig); err != nil {
-		return nil, fmt.Errorf("config parse error: %w", err)
+		return nil, fmt.Errorf("config error: %w", err)
 	}
-	
 	parseOutbounds()
 
-	if len(globalConfig.Inbounds) == 0 {
-		return nil, errors.New("no inbounds configured")
-	}
+	if len(globalConfig.Inbounds) == 0 { return nil, errors.New("no inbounds") }
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
-	if err != nil {
-		return nil, fmt.Errorf("listen failed on %s: %v", inbound.Listen, err)
-	}
-	log.Printf("[Core] SOCKS5 Listening on %s", inbound.Listen)
+	if err != nil { return nil, err }
+	log.Printf("[Core] Listening on %s", inbound.Listen)
 
 	go func() {
 		for {
 			conn, err := listener.Accept()
-			if err != nil {
-				break
-			}
+			if err != nil { break }
 			go handleGeneralConnection(conn, inbound.Tag)
 		}
 	}()
@@ -139,219 +124,153 @@ func parseOutbounds() {
 func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	defer conn.Close()
 	buf := make([]byte, 1)
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return
-	}
+	if _, err := io.ReadFull(conn, buf); err != nil { return }
 
 	var target string
 	var err error
 	var firstFrame []byte
-	var mode int // 1: SOCKS5, 2: CONNECT, 3: HTTP Proxy
+	var mode int 
 
 	switch buf[0] {
 	case 0x05:
 		target, err = handleSOCKS5(conn, inboundTag)
 		mode = 1
-	case 'C', 'G', 'P', 'H', 'D', 'O', 'T':
+	default: 
+		// 简单处理 HTTP/其他
 		target, firstFrame, mode, err = handleHTTP(conn, buf, inboundTag)
-	default:
-		return
 	}
 
 	if err != nil {
-		log.Printf("[%s] Protocol handshake failed: %v", inboundTag, err)
+		log.Printf("[ERROR] Protocol error: %v", err)
 		return
 	}
 
-	outboundTag := "proxy"
-	log.Printf("[%s] %s -> %s | Routed to [%s]", inboundTag, conn.RemoteAddr(), target, outboundTag)
-	dispatch(conn, target, outboundTag, firstFrame, mode)
+	log.Printf("[%s] Request -> %s", inboundTag, target)
+	dispatch(conn, target, "proxy", firstFrame, mode)
 }
 
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
-	handshakeBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, handshakeBuf); err != nil {
-		return "", err
-	}
+	handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
-
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(conn, header); err != nil {
-		return "", err
-	}
-
+	header := make([]byte, 4); io.ReadFull(conn, header)
 	var host string
 	switch header[3] {
-	case 1: // IPv4
-		b := make([]byte, 4)
-		io.ReadFull(conn, b)
-		host = net.IP(b).String()
-	case 3: // Domain
-		b := make([]byte, 1)
-		io.ReadFull(conn, b)
-		d := make([]byte, b[0])
-		io.ReadFull(conn, d)
-		host = string(d)
-	case 4: // IPv6
-		b := make([]byte, 16)
-		io.ReadFull(conn, b)
-		host = net.IP(b).String()
-	default:
-		return "", errors.New("unsupported addr type")
+	case 1: b := make([]byte, 4); io.ReadFull(conn, b); host = net.IP(b).String()
+	case 3: b := make([]byte, 1); io.ReadFull(conn, b); d := make([]byte, b[0]); io.ReadFull(conn, d); host = string(d)
+	case 4: b := make([]byte, 16); io.ReadFull(conn, b); host = net.IP(b).String()
 	}
-
-	portBytes := make([]byte, 2)
-	io.ReadFull(conn, portBytes)
+	portBytes := make([]byte, 2); io.ReadFull(conn, portBytes)
 	port := binary.BigEndian.Uint16(portBytes)
-
 	return net.JoinHostPort(host, fmt.Sprintf("%d", port)), nil
 }
 
 func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, []byte, int, error) {
 	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(initialData), conn))
 	req, err := http.ReadRequest(reader)
-	if err != nil {
-		return "", nil, 0, err
-	}
-
+	if err != nil { return "", nil, 0, err }
 	target := req.Host
-	if !strings.Contains(target, ":") {
-		if req.Method == "CONNECT" {
-			target += ":443"
-		} else {
-			target += ":80"
-		}
-	}
-
-	if req.Method == "CONNECT" {
-		return target, nil, 2, nil
-	}
-
-	var buf bytes.Buffer
-	req.WriteProxy(&buf)
+	if !strings.Contains(target, ":") { if req.Method == "CONNECT" { target += ":443" } else { target += ":80" } }
+	if req.Method == "CONNECT" { return target, nil, 2, nil }
+	var buf bytes.Buffer; req.WriteProxy(&buf)
 	return target, buf.Bytes(), 3, nil
 }
 
 func dispatch(conn net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
-	if outboundTag == "direct" {
-		startDirectTunnel(conn, target, firstFrame, mode)
-		return
-	}
 	startProxyTunnel(conn, target, outboundTag, firstFrame, mode)
 }
 
-func startDirectTunnel(local net.Conn, target string, firstFrame []byte, mode int) {
-	remote, err := net.DialTimeout("tcp", target, 5*time.Second)
-	if err != nil {
-		return
-	}
-	defer remote.Close()
-
-	if mode == 1 {
-		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	}
-	if mode == 2 {
-		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
-
-	if len(firstFrame) > 0 {
-		remote.Write(firstFrame)
-	}
-
-	go io.Copy(remote, local)
-	io.Copy(local, remote)
-}
-
-// 【关键修复】确保此处逻辑与 v2.1 JS 服务端匹配
-func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) error {
+func startProxyTunnel(local net.Conn, target, outboundTag string, firstFrame []byte, mode int) {
+	// 1. 连接 WebSocket
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil {
-		return err
+		log.Printf("[ERROR] Failed to connect to proxy: %v", err)
+		local.Close()
+		return
 	}
 	defer wsConn.Close()
 
-	// 1. 发送 JSON 握手包
+	// 2. 发送握手
+	log.Printf("[Debug] Sending handshake for %s", target)
 	connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
 	jsonHandshake, _ := wrapAsJson([]byte(connectMsg))
-
 	if err := wsConn.WriteMessage(websocket.TextMessage, jsonHandshake); err != nil {
-		return err
+		log.Printf("[ERROR] Failed to send handshake: %v", err)
+		return
 	}
 
-	// 2. 等待服务端 JSON 响应 "X-LINK-OK"
+	// 3. 等待响应
+	log.Printf("[Debug] Waiting for handshake response...")
+	wsConn.SetReadDeadline(time.Now().Add(10 * time.Second)) // 设置10秒超时
 	_, msg, err := wsConn.ReadMessage()
 	if err != nil {
-		return err
+		log.Printf("[ERROR] Failed to read response: %v", err)
+		return
 	}
+	wsConn.SetReadDeadline(time.Time{}) // 取消超时
 
 	okPayload, err := unwrapFromJson(msg)
-	if err != nil || string(okPayload) != "X-LINK-OK" {
-		return fmt.Errorf("handshake failed")
+	if err != nil {
+		log.Printf("[ERROR] Invalid response format: %v", err)
+		return
+	}
+	
+	respStr := string(okPayload)
+	if respStr != "X-LINK-OK" {
+		log.Printf("[ERROR] Handshake rejected by server. Response: %s", respStr)
+		return
 	}
 
-	// 3. 通知本地连接成功
-	if mode == 1 {
-		local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	}
-	if mode == 2 {
-		local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-	}
+	log.Printf("[Success] Tunnel established for %s", target)
 
-	// 4. 数据流转发
+	// 4. 响应本地
+	if mode == 1 { local.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
+	if mode == 2 { local.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
+
+	// 5. 转发
 	done := make(chan bool, 2)
-
 	go func() {
 		buf := make([]byte, 16*1024)
 		for {
 			n, err := local.Read(buf)
 			if n > 0 {
 				jsonData, _ := wrapAsJson(buf[:n])
-				wsConn.WriteMessage(websocket.TextMessage, jsonData)
+				if err := wsConn.WriteMessage(websocket.TextMessage, jsonData); err != nil { break }
 			}
-			if err != nil {
-				break
-			}
+			if err != nil { break }
 		}
 		done <- true
 	}()
-
 	go func() {
 		for {
 			_, msg, err := wsConn.ReadMessage()
-			if err != nil {
-				break
-			}
+			if err != nil { break }
 			payload, _ := unwrapFromJson(msg)
-			if payload != nil {
-				local.Write(payload)
-			}
+			if payload != nil { local.Write(payload) }
 		}
 		done <- true
 	}()
-
 	<-done
-	return nil
 }
 
-// 【关键修复】添加 HTTP Headers 以骗过 Cloudflare
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
-	if !ok {
-		return nil, errors.New("settings not found")
-	}
+	if !ok { return nil, errors.New("settings not found") }
 
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 
-	// 【修复点】构建伪装头
 	requestHeader := http.Header{}
-	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
+	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	requestHeader.Add("Host", host)
+	// Cloudflare 对 Origin 检查很严格，部分节点需要为空或者与 Host 一致
+	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
+
+	log.Printf("[Debug] Dialing WebSocket: %s (IP: %s)", wsURL, settings.ServerIP)
 
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
 		Subprotocols:    []string{settings.Token},
+		HandshakeTimeout: 10 * time.Second,
 	}
 
 	if settings.ServerIP != "" {
@@ -361,22 +280,21 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		}
 	}
 
-	// 传入 requestHeader
-	conn, _, err := dialer.Dial(wsURL, requestHeader)
-	return conn, err
+	conn, resp, err := dialer.Dial(wsURL, requestHeader)
+	if err != nil {
+		if resp != nil {
+			// 【关键】打印 HTTP 状态码，这是判断失败原因的核心
+			return nil, fmt.Errorf("HTTP %s (Code: %d)", resp.Status, resp.StatusCode)
+		}
+		return nil, err
+	}
+	return conn, nil
 }
 
 func parseServerAddr(addr string) (host, port, path string, err error) {
 	path = "/"
-	if idx := strings.Index(addr, "/"); idx != -1 {
-		path = addr[idx:]
-		addr = addr[:idx]
-	}
+	if idx := strings.Index(addr, "/"); idx != -1 { path = addr[idx:]; addr = addr[:idx] }
 	host, port, err = net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-		port = "443"
-		err = nil
-	}
+	if err != nil { host = addr; port = "443"; err = nil }
 	return
 }
