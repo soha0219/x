@@ -1,5 +1,3 @@
-// core/core.go (v3.0 - Smart Fallback Edition)
-// 特性：默认极速二进制，握手失败自动切换 JSON，兼容所有服务端版本
 package core
 
 import (
@@ -144,11 +142,9 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 	log.Printf("[%s] Connecting -> %s", inboundTag, target)
 	
-	// 【核心智能逻辑】尝试建立隧道
-	// 1. 优先尝试二进制
+	// Smart Fallback Logic
 	wsConn, proto, err := tryConnect(target, "proxy", firstFrame, true)
 	if err != nil {
-		// 2. 失败则回退到 JSON
 		log.Printf("[Info] Binary failed (%v), switching to JSON...", err)
 		wsConn, proto, err = tryConnect(target, "proxy", firstFrame, false)
 		if err != nil {
@@ -157,7 +153,6 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 		}
 	}
 
-	// 3. 开始转发
 	if mode == 1 { conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) }
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 
@@ -172,17 +167,14 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 // ======================== Protocol Handlers ========================
 
-// 尝试连接并握手，成功返回 ws 连接
 func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (*websocket.Conn, string, error) {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil { return nil, "", err }
 
-	// 设置握手超时，快速失败以便切换
 	wsConn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	defer wsConn.SetReadDeadline(time.Time{})
 
 	if useBinary {
-		// --- Binary Handshake ---
 		var buf bytes.Buffer
 		buf.Write([]byte{0x01, 0x01})
 		host, portStr, _ := net.SplitHostPort(target)
@@ -207,7 +199,6 @@ func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (
 		return wsConn, "binary", nil
 
 	} else {
-		// --- JSON Handshake ---
 		connectMsg := fmt.Sprintf("X-LINK:%s|%s", target, base64.StdEncoding.EncodeToString(firstFrame))
 		jsonHandshake, _ := wrapAsJson([]byte(connectMsg))
 		if err := wsConn.WriteMessage(websocket.TextMessage, jsonHandshake); err != nil {
@@ -267,8 +258,7 @@ func pipeJSON(local net.Conn, ws *websocket.Conn) {
 	}
 }
 
-// ======================== Common Utils ========================
-
+// ======================== Utils ========================
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	handshakeBuf := make([]byte, 2); io.ReadFull(conn, handshakeBuf)
 	conn.Write([]byte{0x05, 0x00})
@@ -304,11 +294,16 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	requestHeader.Add("Host", host)
 	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
+	
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
-		Subprotocols:    []string{settings.Token},
-		HandshakeTimeout: 5 * time.Second, // 缩短连接超时，加快重试
+		HandshakeTimeout: 5 * time.Second,
 	}
+	// [修复] 只有当 Token 不为空时才添加子协议，避免空协议头导致某些服务器报错
+	if settings.Token != "" {
+		dialer.Subprotocols = []string{settings.Token}
+	}
+
 	if settings.ServerIP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(addr)
