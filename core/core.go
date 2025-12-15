@@ -95,7 +95,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	inbound := globalConfig.Inbounds[0]
 	listener, err := net.Listen("tcp", inbound.Listen)
 	if err != nil { return nil, err }
-	log.Printf("[Core] Smart Listening on %s (Auto Protocol)", inbound.Listen)
+	log.Printf("[Core] Titan Engine v3.0 Listening on %s", inbound.Listen)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -136,18 +136,15 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 
 	if err != nil {
-		log.Printf("[ERROR] Handshake: %v", err)
 		return
 	}
 
-	log.Printf("[%s] Connecting -> %s", inboundTag, target)
-	
+	// [智能] 尝试连接
 	wsConn, proto, err := tryConnect(target, "proxy", firstFrame, true)
 	if err != nil {
-		log.Printf("[Info] Binary failed (%v), switching to JSON...", err)
+		// [智能] 回落到 JSON
 		wsConn, proto, err = tryConnect(target, "proxy", firstFrame, false)
 		if err != nil {
-			log.Printf("[ERROR] All protocols failed: %v", err)
 			return
 		}
 	}
@@ -156,10 +153,8 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	if mode == 2 { conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")) }
 
 	if proto == "binary" {
-		log.Printf("[Success] Tunnel via Binary Protocol")
 		pipeBinary(conn, wsConn)
 	} else {
-		log.Printf("[Success] Tunnel via JSON Protocol")
 		pipeJSON(conn, wsConn)
 	}
 }
@@ -170,8 +165,8 @@ func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (
 	wsConn, err := dialSpecificWebSocket(outboundTag)
 	if err != nil { return nil, "", err }
 
-	// [关键修复] 将握手超时从 3秒 增加到 15秒，给 SOCKS5 链路留足时间
-	wsConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	// [关键] 20秒超时，等待 SOCKS5 链式建立
+	wsConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	defer wsConn.SetReadDeadline(time.Time{})
 
 	if useBinary {
@@ -193,12 +188,12 @@ func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (
 			wsConn.Close(); return nil, "", err
 		}
 		_, msg, err := wsConn.ReadMessage()
-		// [优化] 增加错误日志
 		if err != nil {
-			wsConn.Close(); return nil, "", fmt.Errorf("read handshake failed: %v", err)
+			wsConn.Close(); return nil, "", err
 		}
+		// 验证响应 0x01 0x00
 		if len(msg) < 2 || msg[0] != 0x01 || msg[1] != 0x00 {
-			wsConn.Close(); return nil, "", fmt.Errorf("binary handshake rejected (resp: %x)", msg)
+			wsConn.Close(); return nil, "", fmt.Errorf("rejected")
 		}
 		return wsConn, "binary", nil
 
@@ -212,7 +207,7 @@ func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (
 		if err != nil { wsConn.Close(); return nil, "", err }
 		okPayload, err := unwrapFromJson(msg)
 		if err != nil || string(okPayload) != "X-LINK-OK" {
-			wsConn.Close(); return nil, "", fmt.Errorf("json handshake rejected")
+			wsConn.Close(); return nil, "", fmt.Errorf("rejected")
 		}
 		return wsConn, "json", nil
 	}
@@ -295,18 +290,15 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	host, port, path, _ := parseServerAddr(settings.Server)
 	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 	requestHeader := http.Header{}
-	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	requestHeader.Add("Host", host)
-	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host))
+	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 	
 	dialer := websocket.Dialer{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, ServerName: host},
-		HandshakeTimeout: 10 * time.Second, // 增加连接超时
+		// [关键] 握手超时 20 秒
+		HandshakeTimeout: 20 * time.Second,
 	}
-	if settings.Token != "" {
-		dialer.Subprotocols = []string{settings.Token}
-	}
-
+	if settings.Token != "" { dialer.Subprotocols = []string{settings.Token} }
 	if settings.ServerIP != "" {
 		dialer.NetDial = func(network, addr string) (net.Conn, error) {
 			_, p, _ := net.SplitHostPort(addr)
