@@ -23,7 +23,7 @@ import (
 	"strings"
 	"time"
 
-	"github.comcom/gorilla/websocket"
+	"github.com/gorilla/websocket"
 	"golang.org/x/net/proxy" 
 )
 
