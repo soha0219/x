@@ -2,8 +2,8 @@
 // 职责：只处理纯 JSON 封装协议，伪装性最强。
 // 兼容：X-Link Server v2.6, v2.6.1, v2.7, v1.6 等所有 JSON 系服务端。
 
-//go:build binary
-// +build binary
+//go:build json
+// +build json
 
 package core
 
