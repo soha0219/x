@@ -179,7 +179,7 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 
 	dialer := websocket.Dialer{
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host},
-		HandshakeTimeout: 20 * time.Second,
+		HandshakeTimeout: 5 * time.Second,
 	}
 
 	// 【【【核心修复区】】】
