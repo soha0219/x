@@ -175,6 +175,7 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 
 	requestHeader := http.Header{}
 	requestHeader.Add("Host", host)
+	requestHeader.Add("Origin", fmt.Sprintf("https://%s", host)) // 👈 关键！这里有 Origin
 	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
 	dialer := websocket.Dialer{
