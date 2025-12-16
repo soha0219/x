@@ -1,4 +1,4 @@
-# .github/workflows/build.yml (v4.0 - Dual Core Build)
+# .github/workflows/build.yml (v4.2 - Final Path Fix)
 
 name: Build X-Link Dual Core Kernels
 
@@ -31,7 +31,8 @@ jobs:
           CGO_ENABLED: 0
         run: |
           echo "Building Binary Kernel..."
-          go build -v -trimpath -ldflags="-s -w" -tags binary -o xlink-cli-binary.exe ./cmd/main
+          # 【核心修复】：将编译路径从 ./cmd/main 改为 ./cmd/xlink-cli
+          go build -v -trimpath -ldflags="-s -w" -tags binary -o xlink-cli-binary.exe ./cmd/xlink-cli
 
       - name: Build JSON Core (v2.8)
         env:
@@ -40,6 +41,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           echo "Building JSON Kernel..."
+          # （此路径原本就是正确的，保持不变）
           go build -v -trimpath -ldflags="-s -w" -tags json -o xlink-cli-json.exe ./cmd/xlink-cli
           
       - name: Upload Binary Artifact
