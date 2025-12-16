@@ -161,8 +161,9 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 
 // ... (tryConnect, pipeBinary, pipeJSON, handleSOCKS5, handleHTTP, parseServerAddr 等函数保持不变) ...
 
+
 // ======================== [已修复] dialSpecificWebSocket 函数 ========================
-// 现在支持解析带用户名和密码的 SOCKS5 地址
+// 修复了当用户名也是 "socks5" 时会被错误裁剪的 Bug
 func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 	settings, ok := proxySettingsMap[outboundTag]
 	if !ok {
@@ -189,16 +190,15 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 		var auth *proxy.Auth
 		var socksAddress string
 
-		// 尝试解析包含认证信息的 SOCKS5 URI
-		// 为了兼容性，先补上 "socks5://" 前缀让 url.Parse 工作
-		if !strings.HasPrefix(proxyAddrStr, "socks5://") {
-			// 移除用户可能输入的 "socks5:"
-			proxyAddrStr = strings.TrimPrefix(proxyAddrStr, "socks5:")
+		// [修复逻辑]: 只有当字符串不包含 "://" 时，才补充前缀。
+		// 绝对不要使用 TrimPrefix 去除 "socks5:"，因为那可能是用户名！
+		if !strings.Contains(proxyAddrStr, "://") {
 			proxyAddrStr = "socks5://" + proxyAddrStr
 		}
 		
 		proxyURL, err := url.Parse(proxyAddrStr)
 		if err != nil {
+			log.Printf("[ERROR] Failed to parse SOCKS5 address: %v", err)
 			return nil, fmt.Errorf("invalid SOCKS5 address format: %w", err)
 		}
 
@@ -212,9 +212,10 @@ func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
 			}
 		}
 
-		// 创建 SOCKS5 拨号器，现在可以正确处理认证
+		// 创建 SOCKS5 拨号器
 		socks5Dialer, err := proxy.SOCKS5("tcp", socksAddress, auth, proxy.Direct)
 		if err != nil {
+			log.Printf("[ERROR] Failed to create SOCKS5 dialer: %v", err)
 			return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
 		}
 		dialer.NetDial = socks5Dialer.Dial
