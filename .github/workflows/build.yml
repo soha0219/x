@@ -1,67 +1,46 @@
-# .github/workflows/build.yml (适用于新项目结构)
+# .github/workflows/build.yml (已修复并优化)
 
 name: Build X-Link CLI Kernel
 
+# 【核心修复】: 
+# 添加 push 事件触发器。
+# 现在，每当有代码被推送到 main 分支时，此工作流程都会自动运行。
+# 同时保留 workflow_dispatch，以便您仍然可以手动触发。
 on:
-  workflow_dispatch: # 仅手动触发
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }}
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          # Windows (最常用)
-          - os: windows
-            goos: windows
-            goarch: amd64
-            ext: .exe
-          # 您可以取消注释来构建其他平台
-          # - os: linux
-          #   goos: linux
-          #   goarch: amd6d64
-          #   ext: ""
-          # - os: darwin-arm64
-          #   goos: darwin
-          #   goarch: arm64
-          #   ext: ""
+    name: Build for windows
+    runs-on: ubuntu-latest # 我们只构建 Windows 版本，所以可以简化 strategy
 
     steps:
       - name: Checkout Code
+        # 使用 v4 版本，确保拉取的是触发本次工作流程的最新代码
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23' # 保持您的 Go 版本
+          go-version: '1.23' 
 
-      - name: Initialize Module & Tidy
-        run: |
-          # 您的脚本很棒，我们保留它，但修改模块名以保持一致性
-          if [ ! -f go.mod ]; then
-            # 【【【核心改动 1】】】 模块名应与 main.go 中的 import 路径匹配
-            go mod init xlink-project 
-            go get github.com/gorilla/websocket
-            go mod tidy
-          fi
-          # 确保所有依赖都已下载
-          go mod download
+      # 【优化步骤】: 将依赖处理合并到构建前，更加清晰
+      - name: Download Go Modules
+        run: go mod tidy
 
       - name: Build CLI Binary
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
+          GOOS: windows
+          GOARCH: amd64
           CGO_ENABLED: 0
         run: |
-          # 【【【核心改动 2】】】 
-          # 1. 输出文件名改为 xlink-cli 以反映新的程序
-          # 2. 编译目标从 "." (当前目录) 改为 "./cmd/xlink-cli" (新的 main 包路径)
-          go build -trimpath -ldflags="-s -w" -o xlink-cli-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} ./cmd/xlink-cli
+          # 编译目标是 ./cmd/xlink-cli
+          go build -trimpath -ldflags="-s -w" -o xlink-cli.exe ./cmd/xlink-cli
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          # 【【【核心改动 3】】】 更新上传产物的名称和路径
-          name: xlink-cli-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: xlink-cli-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          name: xlink-cli-windows-amd64
+          path: xlink-cli.exe
