@@ -1,6 +1,12 @@
+
+
 // core/core-binary.go (v3.3 - Pure Binary)
 // 职责：只处理纯二进制流协议，性能最高。
 // 兼容：X-Link Server v3.3
+
+//go:build binary
+// +build binary
+
 package core
 
 import (
