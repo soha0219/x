@@ -31,7 +31,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           echo "Building Binary Kernel..."
-          go build -v -trimpath -ldflags="-s -w" -tags binary -o xlink-cli-binary.exe ./cmd/xlink-cli
+          go build -v -trimpath -ldflags="-s -w" -tags binary -o xlink-cli-binary.exe ./cmd/main
 
       - name: Build JSON Core (v2.8)
         env:
