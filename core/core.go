@@ -88,7 +88,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[Core] Titan Engine v3.1 Listening on %s", inbound.Listen) // 日志版本号可以自行修改
+	log.Printf("[Core] Titan Engine v3.2 Listening on %s", inbound.Listen)
 	go func() {
 		for {
 			conn, err := listener.Accept()
