@@ -1,4 +1,4 @@
-// core/core.go (v3.1 - SOCKS5 fix) 内核文件
+// core/core.go (v3.2 - SOCKS5 Auth fix) 内核文件
 package core
 
 import (
@@ -15,14 +15,15 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/net/proxy" // [修复] 导入 SOCKS5 代理库
+	"golang.org/x/net/proxy" 
 )
 
-// ======================== Structs (已修复) ========================
+// ======================== Structs (无需修改) ========================
 type JsonEnvelope struct {
 	ID   string `json:"id"`
 	Type string `json:"type"`
@@ -44,20 +45,15 @@ type Outbound struct {
 	Protocol string          `json:"protocol"`
 	Settings json.RawMessage `json:"settings,omitempty"`
 }
-
-// [修复] 增加用于解析 SOCKS5 设置的结构体
 type ProxyForwarderSettings struct {
 	Socks5Address string `json:"socks5_address"`
 }
-
-// [修复] 修改 ProxySettings 结构体以包含可选的 SOCKS5 设置
 type ProxySettings struct {
 	Server          string                  `json:"server"`
 	ServerIP        string                  `json:"server_ip"`
 	Token           string                  `json:"token"`
 	ForwarderSettings *ProxyForwarderSettings `json:"proxy_settings,omitempty"`
 }
-
 type Routing struct {
 	Rules           []Rule `json:"rules"`
 	DefaultOutbound string `json:"defaultOutbound,omitempty"`
@@ -75,31 +71,7 @@ var (
 	proxySettingsMap = make(map[string]ProxySettings)
 )
 
-// ======================== Helpers ========================
-func wrapAsJson(payload []byte) ([]byte, error) {
-	idBytes := make([]byte, 4)
-	rand.Read(idBytes)
-	envelope := JsonEnvelope{
-		ID:   fmt.Sprintf("msg_%x", idBytes),
-		Type: "sync_data",
-		TS:   time.Now().UnixMilli(),
-		Data: base64.StdEncoding.EncodeToString(payload),
-	}
-	return json.Marshal(envelope)
-}
-func unwrapFromJson(rawMsg []byte) ([]byte, error) {
-	var envelope JsonEnvelope
-	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
-		return nil, err
-	}
-	if envelope.Type == "pong" {
-		return nil, nil
-	}
-	if envelope.Type != "sync_data" {
-		return nil, errors.New("not sync_data")
-	}
-	return base64.StdEncoding.DecodeString(envelope.Data)
-}
+// ... (其他函数 wrapAsJson, unwrapFromJson, StartInstance 等保持不变) ...
 
 // ======================== Entry Point ========================
 func StartInstance(configContent []byte) (net.Listener, error) {
@@ -116,7 +88,7 @@ func StartInstance(configContent []byte) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[Core] Titan Engine v3.1 Listening on %s", inbound.Listen)
+	log.Printf("[Core] Titan Engine v3.1 Listening on %s", inbound.Listen) // 日志版本号可以自行修改
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -187,7 +159,117 @@ func handleGeneralConnection(conn net.Conn, inboundTag string) {
 	}
 }
 
-// ======================== Protocol Handlers ========================
+// ... (tryConnect, pipeBinary, pipeJSON, handleSOCKS5, handleHTTP, parseServerAddr 等函数保持不变) ...
+
+// ======================== [已修复] dialSpecificWebSocket 函数 ========================
+// 现在支持解析带用户名和密码的 SOCKS5 地址
+func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
+	settings, ok := proxySettingsMap[outboundTag]
+	if !ok {
+		return nil, errors.New("settings not found for outbound tag: " + outboundTag)
+	}
+
+	host, port, path, _ := parseServerAddr(settings.Server)
+	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+
+	requestHeader := http.Header{}
+	requestHeader.Add("Host", host)
+	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
+	dialer := websocket.Dialer{
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host},
+		HandshakeTimeout: 20 * time.Second,
+	}
+
+	// 【【【核心修复区】】】
+	if settings.ForwarderSettings != nil && settings.ForwarderSettings.Socks5Address != "" {
+		proxyAddrStr := settings.ForwarderSettings.Socks5Address
+		log.Printf("[Core] Using SOCKS5 proxy: %s", proxyAddrStr)
+
+		var auth *proxy.Auth
+		var socksAddress string
+
+		// 尝试解析包含认证信息的 SOCKS5 URI
+		// 为了兼容性，先补上 "socks5://" 前缀让 url.Parse 工作
+		if !strings.HasPrefix(proxyAddrStr, "socks5://") {
+			// 移除用户可能输入的 "socks5:"
+			proxyAddrStr = strings.TrimPrefix(proxyAddrStr, "socks5:")
+			proxyAddrStr = "socks5://" + proxyAddrStr
+		}
+		
+		proxyURL, err := url.Parse(proxyAddrStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid SOCKS5 address format: %w", err)
+		}
+
+		socksAddress = proxyURL.Host // host:port 部分
+
+		if proxyURL.User != nil {
+			auth = new(proxy.Auth)
+			auth.User = proxyURL.User.Username()
+			if password, ok := proxyURL.User.Password(); ok {
+				auth.Password = password
+			}
+		}
+
+		// 创建 SOCKS5 拨号器，现在可以正确处理认证
+		socks5Dialer, err := proxy.SOCKS5("tcp", socksAddress, auth, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
+		}
+		dialer.NetDial = socks5Dialer.Dial
+
+	} else if settings.ServerIP != "" {
+		dialer.NetDial = func(network, addr string) (net.Conn, error) {
+			_, p, _ := net.SplitHostPort(addr)
+			return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
+		}
+	}
+
+	if settings.Token != "" {
+		dialer.Subprotocols = []string{settings.Token}
+	}
+
+	conn, resp, err := dialer.Dial(wsURL, requestHeader)
+	if err != nil {
+		if resp != nil {
+			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
+		}
+		return nil, err
+	}
+	return conn, nil
+}
+
+// ... (其余辅助函数保持原样) ...
+// 保持 wrapAsJson, unwrapFromJson, tryConnect, pipeBinary, pipeJSON, 
+// handleGeneralConnection, handleSOCKS5, handleHTTP, parseServerAddr, parseOutbounds
+// 等所有未在此处列出的函数与之前修复版本一致。
+// 为确保完整性，这里将所有函数都包含进来。
+
+func wrapAsJson(payload []byte) ([]byte, error) {
+	idBytes := make([]byte, 4)
+	rand.Read(idBytes)
+	envelope := JsonEnvelope{
+		ID:   fmt.Sprintf("msg_%x", idBytes),
+		Type: "sync_data",
+		TS:   time.Now().UnixMilli(),
+		Data: base64.StdEncoding.EncodeToString(payload),
+	}
+	return json.Marshal(envelope)
+}
+func unwrapFromJson(rawMsg []byte) ([]byte, error) {
+	var envelope JsonEnvelope
+	if err := json.Unmarshal(rawMsg, &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Type == "pong" {
+		return nil, nil
+	}
+	if envelope.Type != "sync_data" {
+		return nil, errors.New("not sync_data")
+	}
+	return base64.StdEncoding.DecodeString(envelope.Data)
+}
 
 func tryConnect(target, outboundTag string, firstFrame []byte, useBinary bool) (*websocket.Conn, string, error) {
 	wsConn, err := dialSpecificWebSocket(outboundTag)
@@ -314,7 +396,6 @@ func pipeJSON(local net.Conn, ws *websocket.Conn) {
 	}
 }
 
-// ======================== Utils ========================
 func handleSOCKS5(conn net.Conn, inboundTag string) (string, error) {
 	handshakeBuf := make([]byte, 2)
 	io.ReadFull(conn, handshakeBuf)
@@ -364,57 +445,6 @@ func handleHTTP(conn net.Conn, initialData []byte, inboundTag string) (string, [
 	var buf bytes.Buffer
 	req.WriteProxy(&buf)
 	return target, buf.Bytes(), 3, nil
-}
-
-// [已修复] dialSpecificWebSocket 函数现在支持通过 SOCKS5 代理进行连接
-func dialSpecificWebSocket(outboundTag string) (*websocket.Conn, error) {
-	settings, ok := proxySettingsMap[outboundTag]
-	if !ok {
-		return nil, errors.New("settings not found for outbound tag: " + outboundTag)
-	}
-
-	host, port, path, _ := parseServerAddr(settings.Server)
-	wsURL := fmt.Sprintf("wss://%s:%s%s", host, port, path)
-
-	requestHeader := http.Header{}
-	requestHeader.Add("Host", host)
-	requestHeader.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-
-	dialer := websocket.Dialer{
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true, ServerName: host},
-		HandshakeTimeout: 20 * time.Second,
-	}
-
-	// [修复] 检查是否存在 SOCKS5 代理配置
-	if settings.ForwarderSettings != nil && settings.ForwarderSettings.Socks5Address != "" {
-		log.Printf("[Core] Using SOCKS5 proxy: %s", settings.ForwarderSettings.Socks5Address)
-		// 创建一个 SOCKS5 拨号器
-		socks5Dialer, err := proxy.SOCKS5("tcp", settings.ForwarderSettings.Socks5Address, nil, proxy.Direct)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create SOCKS5 dialer: %w", err)
-		}
-		// 将 websocket 的拨号器替换为 SOCKS5 拨号器
-		dialer.NetDial = socks5Dialer.Dial
-	} else if settings.ServerIP != "" {
-		// 如果没有 SOCKS5 代理但指定了 IP, 则使用 IP 直连
-		dialer.NetDial = func(network, addr string) (net.Conn, error) {
-			_, p, _ := net.SplitHostPort(addr)
-			return net.DialTimeout(network, net.JoinHostPort(settings.ServerIP, p), 5*time.Second)
-		}
-	}
-
-	if settings.Token != "" {
-		dialer.Subprotocols = []string{settings.Token}
-	}
-
-	conn, resp, err := dialer.Dial(wsURL, requestHeader)
-	if err != nil {
-		if resp != nil {
-			return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
-		}
-		return nil, err
-	}
-	return conn, nil
 }
 
 func parseServerAddr(addr string) (host, port, path string, err error) {
